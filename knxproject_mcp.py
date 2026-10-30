@@ -62,7 +62,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -2403,6 +2403,10 @@ def tool_set(store, args, budget):
 # runs in the background: one call starts it, the next one fetches the result.
 
 STICK_TIMEOUT = 40          # seconds for one stick call; a table read can take a while
+MGMT_GAP_S = 0.4            # quiet time between two device dialogues, see read_device
+PROP_RETRY_S = 1.0          # before reading a property again whose length was wrong
+# bytes a property holds: a value of another length is not that property
+_PROP_LEN = {"application_id": (4, 5), "serial_number": (6,), "order_info": (10,)}
 READ_KEEP_S = 1800          # a finished read stays available this long
 _READS = {}                 # (database, installation, address) -> job
 _READS_LOCK = threading.Lock()
@@ -2513,23 +2517,47 @@ def read_device(store, inst, ia, stick_id, by):
     url, stick = stick_check(stick_id)
     if stick.get("bus_ready") is False:
         raise StickError("the stick reports no KNX bus (transceiver not ready)")
+    # Every verb below is a dialogue of its own (connect ... disconnect), and every
+    # dialogue numbers its frames from 0 again.  The stick does not acknowledge on
+    # layer 2, so the device repeats each answer up to three times; a repeat that
+    # arrives after the next dialogue opened carries the number that dialogue
+    # waits for, and a stick firmware that does not compare the answer with the
+    # question takes it.  Measured 30.10.2026: serial number and order info both
+    # came back as the ApplicationId read just before.  Hence a quiet gap before
+    # each dialogue, and a length check on every property.
+    def mgmt(tool, args):
+        time.sleep(MGMT_GAP_S)
+        return stick_call(url, tool, args)
+
+    def prop(key, obj, pid, count=None):
+        args = {"device": ia, "object": obj, "pid": pid}
+        if count:
+            args["count"] = count
+        for _attempt in range(2):
+            p = mgmt("knx-prop-read", args)
+            v = str(p.get("data") or "") if p.get("ok") else ""
+            if not v or len(v) // 2 in _PROP_LEN[key]:
+                return v
+            time.sleep(PROP_RETRY_S)
+        unreadable.append(key)
+        return ""
+
+    unreadable = []
     dev = {"address": ia}
-    d = stick_call(url, "knx-describe", {"device": ia})
+    d = mgmt("knx-describe", {"device": ia})
     if not d.get("ok"):
         raise StickError("%s did not answer: %s" % (ia, d.get("error") or "no reply"))
     for key in ("mask", "lsm"):
         if d.get(key) is not None:
             dev[key] = d[key]
-    p = stick_call(url, "knx-prop-read", {"device": ia, "object": 3, "pid": 13})
-    if p.get("ok") and p.get("data"):
-        dev["application_id"] = str(p["data"])
+    v = prop("application_id", 3, 13)
+    if v:
+        dev["application_id"] = v
     for pid, key in ((11, "serial_number"), (15, "order_info")):
-        p = stick_call(url, "knx-prop-read", {"device": ia, "object": 0, "pid": pid,
-                                              "count": 1})
-        v = str(p.get("data") or "") if p.get("ok") else ""
+        v = prop(key, 0, pid, 1)
         if v and set(v.upper()) != {"F"}:        # all FF = never written
             dev[key] = v
-    t = stick_call(url, "knx-tables-read", {"device": ia})
+    t = mgmt("knx-tables-read", {"device": ia})
     tables_ok = bool(t.get("ok"))
     if tables_ok:
         dev["associations"] = t.get("associations") or []
@@ -2572,6 +2600,8 @@ def read_device(store, inst, ia, stick_id, by):
            "took_s": round(time.monotonic() - t0, 1)}
     if not tables_ok:
         out["tables_error"] = t.get("error") or "unreadable"
+    if unreadable:
+        out["unreadable"] = sorted(set(unreadable))
     return out
 
 

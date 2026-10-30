@@ -869,6 +869,8 @@ class FakeStick:
         self.serial = "FFF000000001"
         self.answers = True
         self.tables_ok = True
+        self.stale = 0              # property reads that get the previous answer again
+        self.last_prop = None
         self.assoc = [{"tsap": 1, "ga": "3/1/7", "com_obj": 0},
                       {"tsap": 3, "ga": "3/1/9", "com_obj": 5}]
         self.calls = []
@@ -904,7 +906,12 @@ class FakeStick:
             return ({"ok": True, "mask": "0x0701", "lsm": [{"idx": 1, "name": "Loaded"}]}
                     if self.answers else {"ok": False, "error": "not connected"})
         if name == "knx-prop-read":
-            data = {13: "FFF0123410", 11: self.serial, 15: "FFFFFFFFFFFF"}[args["pid"]]
+            data = {13: "FFF0123410", 11: self.serial, 15: "FFFFFFFFFFFFFFFFFFFF"}[args["pid"]]
+            if self.stale and self.last_prop:
+                # a layer-2 repeat of the answer before, taken for this one
+                self.stale -= 1
+                return {"ok": True, "data": self.last_prop}
+            self.last_prop = data
             return {"ok": True, "data": data}
         if name == "knx-tables-read":
             return ({"ok": True, "associations": self.assoc} if self.tables_ok
@@ -922,8 +929,11 @@ class TestReadDevice(Base):
         self.load_all()
         self.stick = FakeStick()
         os.environ["KNXPROJECT_STICK_URL"] = self.stick.url
+        self.gaps = (k.MGMT_GAP_S, k.PROP_RETRY_S)
+        k.MGMT_GAP_S = k.PROP_RETRY_S = 0
 
     def tearDown(self):
+        k.MGMT_GAP_S, k.PROP_RETRY_S = self.gaps
         os.environ.pop("KNXPROJECT_STICK_URL", None)
         self.stick.close()
         super().tearDown()
@@ -985,6 +995,22 @@ class TestReadDevice(Base):
         out = self.read()
         self.assertEqual((out["state"], out["tables_error"]), ("done", "timeout"))
         self.assertEqual(self.bus_links(), before)                  # nothing ended
+
+    def test_a_repeated_answer_is_not_taken_for_another_property(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "0123456789ab", "said": "that stick"})
+        self.stick.stale = 1                       # serial read gets the ApplicationId
+        out = self.read()
+        self.assertEqual((out["state"], out["identity"]["serial"]), ("done", "FFF000000001"))
+        self.assertNotIn("unreadable", out)
+        self.stick.stale, self.stick.last_prop = 4, None   # serial and order info, twice each
+        out = self.read()
+        self.assertEqual(out["state"], "done", out)
+        self.assertEqual(out["unreadable"], ["order_info", "serial_number"])
+        with self.store.reader() as con:
+            serial = k.load_claims(con, "demo", kind="device", keys=["1.2.3"],
+                                   attrs=["serial"], source="bus")
+        self.assertEqual([r["value"] for r in serial], ["FFF000000001"])   # not ended
 
     def test_mdns_resolve_gives_up(self):
         t0 = time.monotonic()
