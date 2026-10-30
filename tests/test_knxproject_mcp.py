@@ -622,6 +622,24 @@ class TestTools(Base):
         self.assertEqual(out["results"][0]["ref"], "1.2.3")
         self.ok("proj-find", {"query": "x", "kinds": ["note"]})
 
+    def test_brief_and_find_read_their_indexes(self):
+        def plan(sql, params):
+            with self.store.reader() as con:
+                return " ".join(r[-1] for r in con.execute("EXPLAIN QUERY PLAN " + sql, params))
+        brief = plan("SELECT count(DISTINCT key) FROM claims WHERE inst=? AND kind=? AND "
+                     "ended_at IS NULL", ("demo", "param"))
+        self.assertIn("COVERING INDEX claims_kind_open", brief)
+        find = plan("SELECT " + k._CLAIM_COLS + " FROM claims WHERE inst=? AND attr IN ("
+                    + k._FIND_ATTRS_SQL + ") AND ended_at IS NULL", ("demo",))
+        self.assertIn("claims_find_v1", find)
+        with self.store.reader() as con:
+            via_index = sorted((r["kind"], r["key"], r["attr"])
+                               for r in k.load_find_claims(con, "demo"))
+            direct = sorted((r["kind"], r["key"], r["attr"])
+                            for r in k.load_claims(con, "demo", attrs=k._FIND_ATTRS))
+        self.assertEqual(via_index, direct)
+        self.assertTrue(via_index)
+
     def test_set_and_withdraw(self):
         out, err = self.call("proj-set", {"ref": "3/1/7", "attr": "name", "value": "Lawn"})
         self.assertTrue(err)

@@ -62,7 +62,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -373,6 +373,15 @@ def ref_text(kind, key):
 # the store: one SQLite database
 # ---------------------------------------------------------------------------
 
+# What proj-find searches.  The partial index below is built from this list, and
+# the find statement names it as literals: with bound parameters SQLite cannot
+# prove that a query lies within a partial index's WHERE and does not use it.
+_FIND_ATTRS = ("name", "description", "comment", "function", "product", "order_number",
+               "location", "app_name", "text", "path", "role", "fhem_autocreate")
+assert all(re.match(r"^[a-z_]+$", a) for a in _FIND_ATTRS)
+_FIND_ATTRS_SQL = ", ".join("'%s'" % a for a in _FIND_ATTRS)
+_CLAIM_COLS = "kind, key, attr, value, source, ref, first_seen, last_seen, ended_at, id"
+
 _DB_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)",
     "CREATE TABLE IF NOT EXISTS installations(id TEXT PRIMARY KEY, name TEXT NOT NULL, "
@@ -387,6 +396,15 @@ _DB_SCHEMA = (
     " UNIQUE(inst, kind, key, attr, source, value))",
     "CREATE INDEX IF NOT EXISTS claims_entity ON claims(inst, kind, key)",
     "CREATE INDEX IF NOT EXISTS claims_source ON claims(inst, source, ended_at)",
+    # proj-brief counts current entries per kind from this index alone; without it
+    # every index entry costs a row lookup (measured on an ESP32-S3: 17 s -> 2.5 s
+    # from an SD card, 0.44 s from internal flash)
+    "CREATE INDEX IF NOT EXISTS claims_kind_open ON claims(inst, kind, ended_at, key)",
+    # everything proj-find reads, and only that (_v1: the attribute list; a changed
+    # list needs a new name, IF NOT EXISTS would keep the old index unused)
+    "CREATE INDEX IF NOT EXISTS claims_find_v1 ON claims(inst, kind, key, attr, value, "
+    "source, ref, first_seen, last_seen) WHERE attr IN (" + _FIND_ATTRS_SQL + ") AND "
+    "ended_at IS NULL",
     "CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, inst TEXT NOT NULL, "
     " kind TEXT NOT NULL, status TEXT NOT NULL, text TEXT NOT NULL, said TEXT, by TEXT, "
     " created TEXT NOT NULL, updated TEXT NOT NULL)",
@@ -1541,8 +1559,16 @@ def _pending_count(con, inst):
 
 # -- proj-find ----------------------------------------------------------------------
 
-_FIND_ATTRS = ("name", "description", "comment", "function", "product", "order_number",
-               "location", "app_name", "text", "path", "role", "fhem_autocreate")
+
+def load_find_claims(con, inst):
+    """The current claims proj-find searches, read from claims_find_v1 alone."""
+    out = []
+    for r in con.execute("SELECT " + _CLAIM_COLS + " FROM claims WHERE inst=? AND attr IN ("
+                         + _FIND_ATTRS_SQL + ") AND ended_at IS NULL", (inst,)):
+        d = dict(r)
+        d["value"] = json.loads(d["value"])
+        out.append(d)
+    return out
 
 
 def tool_find(store, args, budget):
@@ -1561,7 +1587,7 @@ def tool_find(store, args, budget):
             exact = load_claims(con, inst, kind=k, keys=[key])
         except RefError:
             exact = []
-        rows = load_claims(con, inst, attrs=_FIND_ATTRS)
+        rows = load_find_claims(con, inst)
         ents = by_entity(r for r in rows if kinds is None or r["kind"] in kinds)
         hits = []
         if exact:
