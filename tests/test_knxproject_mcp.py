@@ -528,6 +528,45 @@ class TestTools(Base):
         self.assertEqual((op["findings"], op["items_shown"]), (3, 2))
         self.assertIn("proj-note action=list", op["rest"])
 
+    def test_brief_shortens_long_findings_before_dropping_any(self):
+        for i in range(15):
+            self.ok("proj-note", {"kind": "finding", "text": "%02d " % i + "y" * 1500})
+        self.ok("proj-note", {"kind": "todo", "text": "read 1.2.3 again"})
+        op = self.ok("proj-brief")["open"]
+        self.assertEqual((len(op["items"]), op["texts_cut"]), (16, True))
+        self.assertNotIn("items_shown", op)
+        self.assertIn("proj-note action=list", op["rest"])
+        self.assertLessEqual(max(len(it["text"]) for it in op["items"]), k.BRIEF_ITEM_CHARS + 1)
+        for i in range(40):
+            self.ok("proj-note", {"kind": "finding", "text": "%02d " % i + "z" * 1500})
+        op = self.ok("proj-brief")["open"]
+        self.assertEqual(op["findings"], 55)
+        self.assertLessEqual(op["items_shown"], k.BRIEF_OPEN_MAX + 1)   # 20 findings + todo
+        self.assertEqual(op["items"][-1]["kind"], "todo")          # the todo stays
+
+    def test_note_and_history_pages_follow_next_offset(self):
+        for i in range(60):
+            self.ok("proj-note", {"kind": "note", "text": "%02d " % i + "x" * 400,
+                                  "about": ["3/1/7"]})
+
+        def walk(tool, args, key):
+            seen, offset = [], 0
+            for _ in range(50):
+                out = self.ok(tool, dict(args, offset=offset))
+                seen += out[key]
+                if out["next_offset"] is None:
+                    return seen, out["total"]
+                self.assertGreater(out["next_offset"], offset)
+                offset = out["next_offset"]
+            self.fail("%s never reached the last page" % tool)
+
+        notes, total = walk("proj-note", {"action": "list"}, "notes")
+        self.assertEqual((len(notes), len({n["id"] for n in notes})), (total, total))
+        self.assertEqual(total, 60)
+        journal, total = walk("proj-history", {}, "journal")
+        self.assertEqual(len(journal), total)
+        self.assertGreaterEqual(total, 60)
+
     def test_group_detail_and_range(self):
         out = self.ok("proj-group", {"ga": "3/1/8"})
         self.assertEqual(out["name"], "Porch")

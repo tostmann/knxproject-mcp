@@ -62,9 +62,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
+BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
 DB_NAME = "project.sqlite"
 SERVER_NAME = "knxproject-mcp"
 
@@ -1499,16 +1500,25 @@ def tool_brief(store, args, budget):
         "open": dict(open_n, items=open_items),
         "pending_changes": pending,
     }
+    op = out["open"]
+    # over budget: shorten the open items first, then drop the oldest findings
     if _size(out) > budget:
-        out["open"]["items"] = out["open"]["items"][:2]
+        for it in op["items"]:
+            if len(it["text"]) > BRIEF_ITEM_CHARS:
+                it["text"] = it["text"][:BRIEF_ITEM_CHARS] + "…"
+                op["texts_cut"] = True
+    while _size(out) > budget and any(it["kind"] == "finding" for it in op["items"]):
+        del op["items"][max(i for i, it in enumerate(op["items"]) if it["kind"] == "finding")]
+    if _size(out) > budget:
         out["description"] = out["description"][:1500] + "…"
     if _size(out) > budget:
         out["rules"] = out["rules"][:10]
         out["rules_truncated"] = True
-    shown = len(out["open"]["items"])
+    shown = len(op["items"])
     if shown < sum(open_n.values()):
-        out["open"]["items_shown"] = shown
-        out["open"]["rest"] = "proj-note action=list status=open lists them all"
+        op["items_shown"] = shown
+    if shown < sum(open_n.values()) or op.get("texts_cut"):
+        op["rest"] = "proj-note action=list status=open gives every open item in full"
     return _dumps(out)
 
 
@@ -2151,16 +2161,18 @@ def tool_diff(store, args, budget):
 
 def tool_history(store, args, budget):
     ref = _arg_ref(args, "ref", required=False)
+    offset = _arg_int(args, "offset", 0, 0, 10000000)
     with store.reader() as con:
         inst = _inst(con, args)
         if ref is None:
+            total = con.execute("SELECT count(*) FROM journal WHERE inst=?", (inst,)).fetchone()[0]
             js = [dict(r) for r in con.execute(
                 "SELECT at, by, tool, args, result FROM journal WHERE inst=? ORDER BY id DESC "
-                "LIMIT 40", (inst,))]
+                "LIMIT 40 OFFSET ?", (inst, offset))]
             for j in js:
                 j["args"] = json.loads(j["args"] or "null")
                 j["result"] = json.loads(j["result"] or "null")
-            return _dumps(_fill({"installation": inst}, js, "journal", budget))
+            return _dumps(_fill({"installation": inst}, js, "journal", budget, offset, total))
         kind, key = ref
         rows = load_claims(con, inst, kind=kind, keys=[key], ended=True)
         js = [dict(r) for r in con.execute(
@@ -2170,7 +2182,8 @@ def tool_history(store, args, budget):
             j["args"] = json.loads(j["args"] or "null")
         notes = _notes_for(con, inst, [ref], limit=40)
     out = {"ref": ref_text(kind, key), "notes": notes, "journal": js}
-    return _dumps(_fill(out, claim_history(rows), "claims", budget))
+    hist = claim_history(rows)
+    return _dumps(_fill(out, hist[offset:], "claims", budget, offset, len(hist)))
 
 
 # -- proj-note ---------------------------------------------------------------------------
@@ -2196,7 +2209,9 @@ def tool_note(store, args, budget):
                 q += " AND status=?"
                 p.append(status)
             notes = [_note_out(con, r) for r in con.execute(q + " ORDER BY id DESC", p)]
-            return _dumps(_fill({"installation": inst}, notes, "notes", budget))
+            offset = _arg_int(args, "offset", 0, 0, 100000)
+            return _dumps(_fill({"installation": inst}, notes[offset:], "notes", budget,
+                                offset, len(notes)))
         about = args.get("about") or []
         if isinstance(about, str):
             about = [about]
@@ -2441,7 +2456,7 @@ TOOLS = [
          "made, with source, dates and when it ended, plus notes and journal entries. "
          "Without ref: the last changes to the record."),
      "inputSchema": {"type": "object", "properties": {
-         "ref": {"type": "string"}, "installation": _INST_PROP}},
+         "ref": {"type": "string"}, "offset": _OFFSET_PROP, "installation": _INST_PROP}},
      "annotations": _RO},
     {"name": "proj-note",
      "description": (
@@ -2459,6 +2474,7 @@ TOOLS = [
          "text": {"type": "string"},
          "about": {"type": "array", "items": {"type": "string"}},
          "said": {"type": "string", "description": "The operator's words this rests on"},
+         "offset": _OFFSET_PROP,
          "installation": _INST_PROP}},
      "annotations": _RW},
     {"name": "proj-set",
