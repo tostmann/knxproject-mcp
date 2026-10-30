@@ -1,0 +1,30 @@
+# Never in git
+CLAUDE.md
+MEMORY.md
+GEMINI.md
+FACTS.md
+HARDWARE_STATUS.md
+.env
+.env.*
+*.key
+*.pem
+*.log
+schematics/
+datasheets/
+datasheet/
+__pycache__/
+*.pyc
+.claude/
+
+# Installation data never goes into git: project databases, imports, exports.
+# Only the synthetic fixtures the tests build themselves exist.
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.csv.gz
+*.esf
+*.knxproj
+*.zip
+*.tmp
+fhem.cfg*
