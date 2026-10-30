@@ -90,8 +90,9 @@ application program.
   in `claims` before relying on it.
 - A parameter with `ets_only: true` exists only in the ETS project — the device
   does not store it, so it cannot be read back from the device.
-- Com object names from `product` label the slot of the application program;
-  in another channel mode the same number may do something else.
+- `slot_name` (from `product` data) labels the slot of the application
+  program; in another channel mode the same number may do something else.
+  Prefer a `name` from `ets` or the operator; check `channel_modes`.
 - Old BCU1 devices may number objects differently in the project and in the
   device tables.
 - `proj-set` and `proj-note` change this record only. They never switch,

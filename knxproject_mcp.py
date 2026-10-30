@@ -1277,10 +1277,11 @@ def import_claims_jsonl(path):
             if kind not in KINDS or not re.match(r"^[a-z][a-z0-9_]{0,39}$", attr):
                 raise ImportFailed("%s line %d: kind/attr not allowed" % (path, n))
             claims.append((kind, key, attr, value, d.get("note") or ref))
-    entities = {(k, key) for k, key, _a, _v, _r in claims}
+    # the file speaks for the attributes it names, of the entries it names
+    stated = {(k, key, a) for k, key, a, _v, _r in claims}
 
     def scope(kind, key, attr):
-        return (kind, key) in entities
+        return (kind, key, attr) in stated
 
     return claims, scope, ref
 
@@ -1597,7 +1598,7 @@ def _link_index(con, inst, prec, ga_set=None, ia=None):
 
 def _object_names(con, inst, prec, keys):
     ents = by_entity(load_claims(con, inst, kind="object", keys=list(keys),
-                                 attrs=("name", "function", "size", "flags")))
+                                 attrs=("name", "function", "size", "flags", "slot_name")))
     return {key: resolve(rs, prec) for (_k, key), rs in ents.items()}
 
 
@@ -1691,6 +1692,8 @@ def _group_detail(con, inst, prec, ga, budget):
         for attr in ("name", "function", "size", "flags"):
             if value_of(o, attr):
                 e["object_" + attr] = value_of(o, attr)
+        if not value_of(o, "name") and value_of(o, "slot_name"):
+            e["object_slot_name"] = value_of(o, "slot_name")
         lk.append(e)
     out["links"] = lk
     out["claims"] = [c for c in claim_history(rows) if c["attr"] not in ("present",)]
@@ -1708,7 +1711,8 @@ def _group_detail(con, inst, prec, ga, budget):
 
 _DEV_ATTRS = ("name", "description", "location", "role", "comment", "product",
               "order_number", "manufacturer", "app_name", "app_id", "mask", "serial",
-              "order_info", "load_state", "last_modified", "last_download", "sends")
+              "order_info", "load_state", "channel_modes", "last_modified", "last_download",
+              "sends")
 
 
 def tool_device(store, args, budget):
@@ -1769,6 +1773,8 @@ def tool_device(store, args, budget):
             e["name"] = value_of(o, "name")
         if value_of(o, "function"):
             e["function"] = value_of(o, "function")
+        if not value_of(o, "name") and value_of(o, "slot_name"):
+            e["slot_name"] = value_of(o, "slot_name")
         e["groups"] = []
         for x in sorted(per_obj[num], key=lambda x: ga_int(x["ga"])):
             g = {"ga": x["ga"], "sources": x["sources"]}
@@ -1805,7 +1811,8 @@ def _device_objects(ia, prec, objs, links, gnames, query, offset, budget):
     for num in sorted(nums):
         o = resolve(objs.get(("object", obj_key(ia, num)), []), prec)
         e = {"object": num}
-        for attr in ("name", "function", "size", "flags", "dpt", "priority", "description"):
+        for attr in ("name", "function", "size", "flags", "dpt", "priority", "description",
+                     "slot_name"):
             if value_of(o, attr):
                 e[attr] = value_of(o, attr)
         if value_of(o, "visible") is False:
@@ -1819,7 +1826,8 @@ def _device_objects(ia, prec, objs, links, gnames, query, offset, budget):
         items.append(e)
     header = {"address": ia, "section": "objects",
               "legend": "groups: '*' marks the sending group address; flags C R W T U I, "
-                        "'-' = off"}
+                        "'-' = off; slot_name = name of the slot in the product data, "
+                        "which the channel's mode may not use that way"}
     return _fill(header, items[offset:], "objects", budget, offset, len(items))
 
 

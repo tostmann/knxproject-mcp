@@ -453,14 +453,23 @@ class TestOtherImports(Base):
         self.imp("observe", self.path("o.json", json.dumps(obs)), as_of="2026-08-01")
         out = self.ok("proj-group", {"ga": "3/1/7"})
         self.assertEqual(out["traffic"]["count"], 4)
-        lines = [{"ref": "1.2.3#0", "attr": "name", "value": "Slot name"},
+        lines = [{"ref": "1.2.3#0", "attr": "slot_name", "value": "Slot name"},
                  {"kind": "device", "key": "1.2.3", "attr": "location", "value": "Cellar"}]
         p = self.path("c.jsonl", "\n".join(json.dumps(x) for x in lines))
         with self.assertRaises(k.ImportFailed):
             self.imp("claims", p)                              # no source
         self.imp("claims", p, source="product")
         out = self.ok("proj-device", {"address": "1.2.3", "section": "objects"})
-        self.assertEqual(out["objects"][0]["name"], "Slot name")
+        self.assertEqual(out["objects"][0]["slot_name"], "Slot name")
+        self.assertNotIn("name", out["objects"][0])
+        # a later file about other attributes of the same device ends nothing else
+        self.imp("inventory", self.path("inv.json", json.dumps(INVENTORY)), as_of="2026-08-01")
+        p2 = self.path("c2.jsonl", json.dumps({"ref": "1.2.3", "attr": "channel_modes",
+                                               "value": ["K1: switch"]}))
+        st = self.imp("claims", p2, source="bus", as_of="2026-08-02")[0][1]
+        self.assertEqual(st["ended"], 0)
+        dev = self.ok("proj-device", {"address": "1.2.3"})
+        self.assertEqual((dev["app_id"], dev["channel_modes"]), ("FFF0123410", ["K1: switch"]))
         bad = self.path("b.jsonl", json.dumps({"ref": "1.2.3", "attr": "Bad Attr", "value": 1}))
         with self.assertRaises(k.ImportFailed):
             self.imp("claims", bad, source="product")
