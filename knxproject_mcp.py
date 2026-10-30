@@ -62,8 +62,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SCHEMA_VERSION = 1
+BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 DB_NAME = "project.sqlite"
 SERVER_NAME = "knxproject-mcp"
 
@@ -677,7 +678,9 @@ class ImportFailed(Exception):
     pass
 
 
-def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None):
+def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None, date_from=None):
+    """date_from: "data" (the input states it), "given" (--as-of) or "file" (only the
+    file's modification time is known; the brief then calls the date unknown)."""
     seen = norm_ts(seen) or _now_ts()
     claims = list(collections.OrderedDict(
         ((k, key, a, _dumps(v)), (k, key, a, v, r)) for k, key, a, v, r in claims).values())
@@ -690,6 +693,8 @@ def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None):
         st = put_claims(con, inst, source, claims, seen, import_id=iid, by=by or "cli",
                         scope=scope)
         st["seen"] = seen
+        if date_from:
+            st["date_from"] = date_from
         con.execute("UPDATE imports SET stats=? WHERE id=?", (_dumps(st), iid))
         journal(con, inst, by or "cli", "import:" + fmt, {"ref": ref, "seen": seen}, st)
     return st
@@ -1443,11 +1448,18 @@ def tool_brief(store, args, budget):
                              "AND j.source=i.source AND j.format=i.format) ORDER BY source",
                              (inst,)):
             st = json.loads(r["stats"] or "{}")
-            srcs.append({"source": r["source"], "format": r["format"], "ref": r["ref"],
-                         "as_of": (r["seen"] or "")[:10], "imported": r["at"][:10],
-                         "claims": st.get("asserted")})
+            e = {"source": r["source"], "format": r["format"], "ref": r["ref"],
+                 "as_of": (r["seen"] or "")[:10], "imported": r["at"][:10],
+                 "claims": st.get("asserted")}
+            if st.get("date_from") == "file":
+                # only the file's modification time is known, not when the data was true
+                e["as_of"] = None
+                e["file_date"] = (r["seen"] or "")[:10]
+            srcs.append(e)
+        # the record's own name and description are not decisions about the installation
         user_n = con.execute("SELECT count(*) FROM claims WHERE inst=? AND source='user' AND "
-                             "ended_at IS NULL", (inst,)).fetchone()[0]
+                             "ended_at IS NULL AND NOT (kind='installation' AND attr IN "
+                             "('name', 'description', 'bus_access'))", (inst,)).fetchone()[0]
         rules = [_note_out(con, r, full=False) for r in con.execute(
             "SELECT * FROM notes WHERE inst=? AND kind='rule' AND status IN ('open','confirmed') "
             "ORDER BY id", (inst,))]
@@ -1457,12 +1469,15 @@ def tool_brief(store, args, budget):
             rs = con.execute("SELECT * FROM notes WHERE inst=? AND kind=? AND status='open' "
                              "ORDER BY id DESC", (inst, kind)).fetchall()
             open_n[kind + "s"] = len(rs)
-            open_items += [_note_out(con, r, full=False) for r in rs[:6]]
+            open_items += [_note_out(con, r, full=False) for r in rs[:BRIEF_OPEN_MAX]]
         pending = _pending_count(con, inst)
     desc = value_of(res, "description") or ""
+    access = value_of(res, "bus_access")
     out = {
         "installation": {"id": inst, "name": value_of(res, "name") or row["name"]},
         "description": desc[:4000] + ("…" if len(desc) > 4000 else ""),
+        "bus_access": access or "not recorded: which stick or interface reaches this bus "
+                                "is unknown to this record",
         "rules": rules,
         "how_to": [
             "Values come with a source; names may differ between sources. proj-group / "
@@ -1472,6 +1487,10 @@ def tool_brief(store, args, budget):
             "as a fact.",
             "This record never changes the bus. Changing a device is a separate step with "
             "the stick's own tools, after the operator agreed.",
+            "A stick's tools act on the bus that stick is wired to, which need not be this "
+            "installation's. Before reading or writing a device of it, compare the stick's "
+            "describe (stick_id, own address) with bus_access and look for this "
+            "installation's senders in its passive observe list.",
             "Draw the installation from proj-topology (format=mermaid gives a ready graph)."],
         "precedence": prec,
         "counts": counts,
@@ -1486,6 +1505,10 @@ def tool_brief(store, args, budget):
     if _size(out) > budget:
         out["rules"] = out["rules"][:10]
         out["rules_truncated"] = True
+    shown = len(out["open"]["items"])
+    if shown < sum(open_n.values()):
+        out["open"]["items_shown"] = shown
+        out["open"]["rest"] = "proj-note action=list status=open lists them all"
     return _dumps(out)
 
 
@@ -2236,7 +2259,8 @@ def tool_note(store, args, budget):
 # -- proj-set ------------------------------------------------------------------------------
 
 _SET_ATTRS = {
-    "installation": {"name": "text", "description": "longtext", "precedence": "sources"},
+    "installation": {"name": "text", "description": "longtext", "precedence": "sources",
+                     "bus_access": "longtext"},
     "area": {"name": "text", "description": "text"},
     "line": {"name": "text", "description": "text", "medium": "text"},
     "device": {"name": "text", "description": "text", "location": "text", "role": "text",
@@ -2441,8 +2465,8 @@ TOOLS = [
      "description": (
          "Record a decision of the operator as a claim of source 'user' (it outranks the "
          "imported sources). Only what the operator said or asked for -- said quotes them. "
-         "Names, descriptions, locations, datapoint types, the installation description and "
-         "precedence; and the target state of the installation (device/group present, link "
+         "Names, descriptions, locations, datapoint types, the installation description, "
+         "bus_access (which stick or interface reaches its bus) and precedence; and the target state of the installation (device/group present, link "
          "present/send, parameter value), which proj-diff a=user b=bus then lists as work "
          "left to do. value null withdraws the operator's earlier decision. Changes the "
          "record only, never the bus."),
@@ -3669,6 +3693,16 @@ def resolve_serve_config(args):
     return cfg
 
 
+def _dated(as_of, seen, path):
+    """-> (timestamp, date_from): --as-of first, then the date the input states,
+    then the file's modification time."""
+    if as_of:
+        return as_of, "given"
+    if seen:
+        return seen, "data"
+    return _file_date(path), "file"
+
+
 def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, by=None):
     """-> list of (path, stats)."""
     results = []
@@ -3679,40 +3713,44 @@ def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, b
             dated.append((dm.group(1) if dm else norm_ts(as_of) or _file_date(p), p))
         for _d, p in sorted(dated):
             claims, seen, ref = import_fhem(p)
-            st = record_import(store, inst, "fhem", "fhem", ref,
-                               seen or as_of or _file_date(p), claims,
-                               lambda k, key, a: True, by)
+            # a backup's own date wins over --as-of: several files, one time line
+            ts, date_from = _dated(None, seen, p) if seen else _dated(as_of, None, p)
+            st = record_import(store, inst, "fhem", "fhem", ref, ts, claims,
+                               lambda k, key, a: True, by, date_from)
             results.append((p, st))
         return results
     if len(paths) != 1:
         raise ImportFailed("%s takes one path" % fmt)
     p = paths[0]
+    everything = lambda k, key, a: True  # noqa: E731
     if fmt == "ets3":
         claims, seen, ref = import_ets3(p, project)
-        st = record_import(store, inst, "ets", "ets3", ref, as_of or seen, claims,
-                           lambda k, key, a: True, by)
+        ts, date_from = _dated(as_of, seen, p)
+        st = record_import(store, inst, "ets", "ets3", ref, ts, claims, everything, by, date_from)
     elif fmt == "esf":
         claims, ref = import_esf(p)
-        st = record_import(store, inst, "esf", "esf", ref, as_of or _file_date(p), claims,
-                           lambda k, key, a: True, by)
+        ts, date_from = _dated(as_of, None, p)
+        st = record_import(store, inst, "esf", "esf", ref, ts, claims, everything, by, date_from)
     elif fmt == "inventory":
         claims, scope, seen, ref = import_inventory(p)
-        st = record_import(store, inst, "bus", "inventory", ref, as_of or seen or _file_date(p),
-                           claims, scope, by)
+        ts, date_from = _dated(as_of, seen, p)
+        st = record_import(store, inst, "bus", "inventory", ref, ts, claims, scope, by, date_from)
     elif fmt == "observe":
         claims, ref = import_observe(p)
-        st = record_import(store, inst, "observed", "observe", ref, as_of or _file_date(p),
-                           claims, None, by)
+        ts, date_from = _dated(as_of, None, p)
+        st = record_import(store, inst, "observed", "observe", ref, ts, claims, None, by,
+                           date_from)
     elif fmt == "ha-yaml":
         claims, ref = import_ha_yaml(p)
-        st = record_import(store, inst, "ha", "ha-yaml", ref, as_of or _file_date(p), claims,
-                           lambda k, key, a: True, by)
+        ts, date_from = _dated(as_of, None, p)
+        st = record_import(store, inst, "ha", "ha-yaml", ref, ts, claims, everything, by,
+                           date_from)
     elif fmt == "claims":
         if source not in SOURCES:
             raise ImportFailed("claims need --source: %s" % ", ".join(DEFAULT_PRECEDENCE))
         claims, scope, ref = import_claims_jsonl(p)
-        st = record_import(store, inst, source, "claims", ref, as_of or _file_date(p), claims,
-                           scope, by)
+        ts, date_from = _dated(as_of, None, p)
+        st = record_import(store, inst, source, "claims", ref, ts, claims, scope, by, date_from)
     else:
         raise ImportFailed("unknown format %r" % fmt)
     results.append((p, st))
@@ -3735,8 +3773,10 @@ def main(argv=None):
         for p, st in run_import(store, args.format, args.paths, args.installation,
                                 as_of=args.as_of, project=args.project, source=args.source,
                                 by=args.by):
-            print("%s: %d claims (%d new, %d reopened, %d ended), as of %s" % (
-                p, st["asserted"], st["new"], st["reopened"], st["ended"], st["seen"]))
+            print("%s: %d claims (%d new, %d reopened, %d ended), as of %s%s" % (
+                p, st["asserted"], st["new"], st["reopened"], st["ended"], st["seen"],
+                " (file date, pass --as-of if you know better)"
+                if st.get("date_from") == "file" else ""))
         return 0
     except (ConfigError, StoreError, ImportFailed) as e:
         print("knxproject-mcp: %s" % e, file=sys.stderr)

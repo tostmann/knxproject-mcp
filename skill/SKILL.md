@@ -87,7 +87,14 @@ application program.
 - A name from one source is not proof of what a channel does today. When
   sources disagree, say so.
 - `ets` data can be many years old; check `as_of` in `proj-brief` and the dates
-  in `claims` before relying on it.
+  in `claims` before relying on it. `as_of: null` with a `file_date` means
+  nobody knows when the data was true; the file date only says when the file
+  was last written.
+- The KNX stick you can reach is wired to one bus, and that need not be this
+  installation's. Before a stick tool reads or writes a device listed here,
+  compare the stick's describe (stick id, own address) with `bus_access` in
+  `proj-brief`, and look for this installation's senders in the stick's
+  passive observe list. If they do not match, say so instead of acting.
 - A parameter with `ets_only: true` exists only in the ETS project — the device
   does not store it, so it cannot be read back from the device.
 - `slot_name` (from `product` data) labels the slot of the application

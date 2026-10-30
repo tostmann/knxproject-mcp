@@ -1,6 +1,7 @@
 """Tests for knxproject-mcp.  Every fixture is synthetic and built here."""
 
 import csv
+import datetime
 import gzip
 import http.client
 import io
@@ -491,6 +492,41 @@ class TestTools(Base):
         self.assertEqual({s["source"] for s in out["sources"]}, {"ets", "esf", "bus", "ha", "fhem"})
         self.assertEqual(out["pending_changes"], 0)
         self.assertEqual(out["rules"], [])
+        self.assertIn("not recorded", out["bus_access"])
+        self.assertEqual(out["decisions_by_user"], 0)
+
+    def test_brief_dates_open_items_and_access(self):
+        obs = {"what": "ga", "window_s": 60, "rows": [{"ga": "3/1/7", "count": 4}]}
+        p = self.path("o.json", json.dumps(obs))
+        os.utime(p, (1754000000, 1754000000))
+        self.imp("observe", p)                                 # no --as-of: only the file time
+        src = {s["source"]: s for s in self.ok("proj-brief")["sources"]}
+        self.assertIsNone(src["observed"]["as_of"])
+        self.assertEqual(src["observed"]["file_date"],
+                         datetime.datetime.fromtimestamp(1754000000).strftime("%Y-%m-%d"))
+        self.assertEqual(src["esf"]["as_of"], "2020-01-01")   # --as-of given
+        self.assertNotIn("file_date", src["esf"])
+        self.ok("proj-set", {"ref": "installation", "attr": "description",
+                             "value": "A house", "said": "describe it"})
+        self.ok("proj-set", {"ref": "installation", "attr": "bus_access",
+                             "value": "stick 1.2.250", "said": "that stick"})
+        brief = self.ok("proj-brief")
+        self.assertEqual(brief["bus_access"], "stick 1.2.250")
+        self.assertEqual(brief["decisions_by_user"], 0)       # the record's own text
+        self.ok("proj-set", {"ref": "3/1/7", "attr": "name", "value": "Lawn", "said": "s"})
+        self.assertEqual(self.ok("proj-brief")["decisions_by_user"], 1)
+        for i in range(3):
+            self.ok("proj-note", {"kind": "finding", "text": "lead %d" % i})
+        op = self.ok("proj-brief")["open"]
+        self.assertEqual((len(op["items"]), "rest" in op), (3, False))
+        old = k.BRIEF_OPEN_MAX
+        k.BRIEF_OPEN_MAX = 2
+        try:
+            op = self.ok("proj-brief")["open"]
+        finally:
+            k.BRIEF_OPEN_MAX = old
+        self.assertEqual((op["findings"], op["items_shown"]), (3, 2))
+        self.assertIn("proj-note action=list", op["rest"])
 
     def test_group_detail_and_range(self):
         out = self.ok("proj-group", {"ga": "3/1/8"})
