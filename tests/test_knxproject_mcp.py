@@ -631,7 +631,7 @@ class TestTools(Base):
         self.assertIn("COVERING INDEX claims_kind_open", brief)
         find = plan("SELECT " + k._CLAIM_COLS + " FROM claims WHERE inst=? AND attr IN ("
                     + k._FIND_ATTRS_SQL + ") AND ended_at IS NULL", ("demo",))
-        self.assertIn("claims_find_v1", find)
+        self.assertIn("COVERING INDEX claims_find_v2", find)
         with self.store.reader() as con:
             via_index = sorted((r["kind"], r["key"], r["attr"])
                                for r in k.load_find_claims(con, "demo"))

@@ -62,7 +62,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -400,11 +400,13 @@ _DB_SCHEMA = (
     # every index entry costs a row lookup (measured on an ESP32-S3: 17 s -> 2.5 s
     # from an SD card, 0.44 s from internal flash)
     "CREATE INDEX IF NOT EXISTS claims_kind_open ON claims(inst, kind, ended_at, key)",
-    # everything proj-find reads, and only that (_v1: the attribute list; a changed
-    # list needs a new name, IF NOT EXISTS would keep the old index unused)
-    "CREATE INDEX IF NOT EXISTS claims_find_v1 ON claims(inst, kind, key, attr, value, "
-    "source, ref, first_seen, last_seen) WHERE attr IN (" + _FIND_ATTRS_SQL + ") AND "
-    "ended_at IS NULL",
+    # everything proj-find reads, and only that.  The version in the name stands for
+    # the definition: a changed one needs a new name (IF NOT EXISTS would keep the
+    # old index, unused) and the old name dropped.
+    "DROP INDEX IF EXISTS claims_find_v1",
+    "CREATE INDEX IF NOT EXISTS claims_find_v2 ON claims(inst, kind, key, attr, value, "
+    "source, ref, first_seen, last_seen, ended_at) WHERE attr IN (" + _FIND_ATTRS_SQL + ") "
+    "AND ended_at IS NULL",
     "CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, inst TEXT NOT NULL, "
     " kind TEXT NOT NULL, status TEXT NOT NULL, text TEXT NOT NULL, said TEXT, by TEXT, "
     " created TEXT NOT NULL, updated TEXT NOT NULL)",
@@ -1561,7 +1563,7 @@ def _pending_count(con, inst):
 
 
 def load_find_claims(con, inst):
-    """The current claims proj-find searches, read from claims_find_v1 alone."""
+    """The current claims proj-find searches, read from claims_find_v2 alone."""
     out = []
     for r in con.execute("SELECT " + _CLAIM_COLS + " FROM claims WHERE inst=? AND attr IN ("
                          + _FIND_ATTRS_SQL + ") AND ended_at IS NULL", (inst,)):
