@@ -62,7 +62,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -101,7 +101,9 @@ INSTRUCTIONS = (
     "the house. Every value carries its source. START every conversation with "
     "proj-brief: it holds the description and the binding rules of the installation. "
     "How to work with it: resource " + SKILL_URI + ". The writing tools (proj-set, "
-    "proj-note) change this record only, never the bus."
+    "proj-note) change this record only, never the bus. proj-read-device reads one device "
+    "through the installation's KNX stick (bus traffic, reads only): only when the operator "
+    "asked for it."
 )
 
 
@@ -1065,6 +1067,29 @@ def _stick_payload(path):
     return data
 
 
+def inventory_device_claims(ia, d, ref):
+    """Claims of one device as a stick's inventory reports it."""
+    claims = [("device", ia, "present", True, ref)]
+    for attr, col in (("mask", "mask"), ("app_id", "application_id"),
+                      ("serial", "serial_number"), ("order_info", "order_info")):
+        v = d.get(col)
+        if isinstance(v, str) and v.strip():
+            claims.append(("device", ia, attr, v.strip().upper() if attr == "app_id"
+                           else v.strip(), ref))
+    lsm = d.get("lsm")
+    if isinstance(lsm, list) and lsm:
+        claims.append(("device", ia, "load_state",
+                       " ".join("%s:%s" % (x.get("idx"), x.get("name")) for x in lsm
+                                if isinstance(x, dict)), ref))
+    for a in d.get("associations") or []:
+        ga = norm_ga(a.get("ga"))
+        num = a.get("com_obj")
+        if ga is None or not isinstance(num, int):
+            continue
+        claims.append(("link", link_key(ia, num, ga), "present", True, ref))
+    return claims
+
+
 def import_inventory(path):
     """knx_inventory reply: devices with their tables.  The scanned ranges
     (`lines`) say where an absent device is absent."""
@@ -1079,24 +1104,7 @@ def import_inventory(path):
         if ia is None:
             continue
         listed.add(ia)
-        claims.append(("device", ia, "present", True, ref))
-        for attr, col in (("mask", "mask"), ("app_id", "application_id"),
-                          ("serial", "serial_number"), ("order_info", "order_info")):
-            v = d.get(col)
-            if isinstance(v, str) and v.strip():
-                claims.append(("device", ia, attr, v.strip().upper() if attr == "app_id"
-                               else v.strip(), ref))
-        lsm = d.get("lsm")
-        if isinstance(lsm, list) and lsm:
-            claims.append(("device", ia, "load_state",
-                           " ".join("%s:%s" % (x.get("idx"), x.get("name")) for x in lsm
-                                    if isinstance(x, dict)), ref))
-        for a in d.get("associations") or []:
-            ga = norm_ga(a.get("ga"))
-            num = a.get("com_obj")
-            if ga is None or not isinstance(num, int):
-                continue
-            claims.append(("link", link_key(ia, num, ga), "present", True, ref))
+        claims += inventory_device_claims(ia, d, ref)
     ranges = []
     for ln in (data.get("lines") or []) if isinstance(data, dict) else []:
         lo, hi = norm_ia(ln.get("from")), norm_ia(ln.get("to"))
@@ -1460,7 +1468,7 @@ def tool_brief(store, args, budget):
         # the record's own name and description are not decisions about the installation
         user_n = con.execute("SELECT count(*) FROM claims WHERE inst=? AND source='user' AND "
                              "ended_at IS NULL AND NOT (kind='installation' AND attr IN "
-                             "('name', 'description', 'bus_access'))", (inst,)).fetchone()[0]
+                             "('name', 'description', 'bus_access', 'stick_id'))", (inst,)).fetchone()[0]
         rules = [_note_out(con, r, full=False) for r in con.execute(
             "SELECT * FROM notes WHERE inst=? AND kind='rule' AND status IN ('open','confirmed') "
             "ORDER BY id", (inst,))]
@@ -1479,6 +1487,7 @@ def tool_brief(store, args, budget):
         "description": desc[:4000] + ("…" if len(desc) > 4000 else ""),
         "bus_access": access or "not recorded: which stick or interface reaches this bus "
                                 "is unknown to this record",
+        "stick_id": value_of(res, "stick_id"),
         "rules": rules,
         "how_to": [
             "Values come with a source; names may differ between sources. proj-group / "
@@ -1492,6 +1501,9 @@ def tool_brief(store, args, budget):
             "installation's. Before reading or writing a device of it, compare the stick's "
             "describe (stick_id, own address) with bus_access and look for this "
             "installation's senders in its passive observe list.",
+            "To bring the record up to date with a device, proj-read-device reads it through "
+            "the stick named by stick_id (reads only, but real bus traffic: only when the "
+            "operator asked).",
             "Draw the installation from proj-topology (format=mermaid gives a ready graph)."],
         "precedence": prec,
         "counts": counts,
@@ -2275,7 +2287,7 @@ def tool_note(store, args, budget):
 
 _SET_ATTRS = {
     "installation": {"name": "text", "description": "longtext", "precedence": "sources",
-                     "bus_access": "longtext"},
+                     "bus_access": "longtext", "stick_id": "stick_id"},
     "area": {"name": "text", "description": "text"},
     "line": {"name": "text", "description": "text", "medium": "text"},
     "device": {"name": "text", "description": "text", "location": "text", "role": "text",
@@ -2311,6 +2323,12 @@ def _check_value(kind_, vtype, value):
         v = value.strip().upper().replace("DPST-", "").replace("DPT-", "").replace("-", ".")
         main, _, sub = v.partition(".")
         return "%d.%03d" % (int(main), int(sub)) if sub else str(int(main))
+    if vtype == "stick_id":
+        v = re.sub(r"[\s:._-]", "", str(value).lower())
+        if not re.match(r"^[0-9a-f]{12}$", v):
+            raise ToolError("invalid_value", "a stick id: 12 hex digits, as the stick's "
+                                             "describe reports it")
+        return v
     if vtype == "app_id":
         v = re.sub(r"[\s:._-]", "", str(value).upper())
         if not re.match(r"^([0-9A-F]{8}|[0-9A-F]{10})$", v):
@@ -2373,6 +2391,259 @@ def tool_set(store, args, budget):
         result["pending"] = ("recorded as the target state; the devices still hold the old "
                              "one until they are programmed. proj-diff a=user b=bus lists it.")
     return _dumps(dict(result, ok=True))
+
+
+# -- proj-read-device -------------------------------------------------------------------
+#
+# The one tool that reaches a bus.  It reads a device through the installation's
+# busware KNX stick (that stick's MCP server on the LAN, found by mDNS) and records
+# what the device holds as source "bus": identity, load state and the two
+# commissioning tables.  It only reads.  A read takes longer than a client should
+# wait (and longer than a stick that relays this server lets a call take), so it
+# runs in the background: one call starts it, the next one fetches the result.
+
+STICK_TIMEOUT = 40          # seconds for one stick call; a table read can take a while
+READ_KEEP_S = 1800          # a finished read stays available this long
+_READS = {}                 # (database, installation, address) -> job
+_READS_LOCK = threading.Lock()
+_RESOLVE_IFACE = None       # local IPv4 for mDNS questions; set by serve()
+
+
+class StickError(Exception):
+    pass
+
+
+def mdns_resolve(host, iface=None, timeout=2.0):
+    """IPv4 address of <host>.local or None.  A one-shot (legacy unicast) question,
+    RFC 6762 6.7: the responder answers to our own port."""
+    labels = tuple(host.split("."))
+    if labels[-1].lower() != "local":
+        labels += ("local",)
+    query = build_message(random.randrange(1, 0xFFFF), 0, questions=[(labels, T_A, C_IN)])
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return None
+    try:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+        if iface:
+            s.bind((iface, 0))
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(iface))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            s.sendto(query, (MDNS_GROUP, MDNS_PORT))
+            until = min(deadline, time.monotonic() + 0.5)
+            while time.monotonic() < until:
+                s.settimeout(max(0.01, until - time.monotonic()))
+                try:
+                    data, _src = s.recvfrom(9000)
+                    msg = parse_message(data)
+                except socket.timeout:
+                    break
+                except ValueError:
+                    continue
+                for r in msg["records"]:
+                    if (r["type"] == T_A and r["rdlen"] == 4
+                            and _key(r["name"]) == _key(labels)):
+                        return socket.inet_ntoa(data[r["rdata_pos"]:r["rdata_pos"] + 4])
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return None
+
+
+def stick_url(stick_id):
+    """MCP endpoint of the stick: KNXPROJECT_STICK_URL, else busware-knx-<id>.local."""
+    url = _env("KNXPROJECT_STICK_URL")
+    if url:
+        return url
+    ip = mdns_resolve("busware-knx-%s" % stick_id, _RESOLVE_IFACE)
+    return "http://%s/mcp" % ip if ip else None
+
+
+def stick_call(url, tool, args, timeout=STICK_TIMEOUT):
+    """One tools/call on the stick -> the verb's reply (a dict carrying ok)."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}).encode("utf-8")
+    req = urllib.request.Request(url, body, {"Content-Type": "application/json",
+                                             "Accept": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            msg = json.loads(r.read().decode("utf-8"))
+    except (OSError, ValueError) as e:
+        raise StickError("%s at %s: %s" % (tool, url, e))
+    if not isinstance(msg, dict) or "error" in msg:
+        raise StickError("%s: %s" % (tool, (msg or {}).get("error", {}).get("message")
+                                     if isinstance(msg, dict) else "no JSON-RPC reply"))
+    try:
+        reply = json.loads(msg["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise StickError("%s: the stick sent an unexpected reply" % tool)
+    if not isinstance(reply, dict):
+        raise StickError("%s: the stick sent an unexpected reply" % tool)
+    if msg["result"].get("isError"):
+        reply.setdefault("ok", False)
+    return reply
+
+
+def stick_check(stick_id):
+    """-> (url, facts) of the installation's stick.  Talks to the stick, not the bus."""
+    if not stick_id:
+        raise StickError("this record names no stick: proj-set installation stick_id "
+                         "(the stick_id its describe reports) first")
+    url = stick_url(stick_id)
+    if not url:
+        raise StickError("stick %s is not on the network (no mDNS answer for "
+                         "busware-knx-%s.local)" % (stick_id, stick_id))
+    d = stick_call(url, "describe", {}, timeout=10)
+    got = str(d.get("stick_id") or "").lower()
+    if got != stick_id:
+        raise StickError("the stick at %s is %s, not this installation's stick %s"
+                         % (url, got or "unknown", stick_id))
+    knx = d.get("knx") if isinstance(d.get("knx"), dict) else {}
+    return url, {"stick_id": got, "url": url, "own_address": knx.get("own_address"),
+                 "bus_ready": knx.get("tpuart_ready")}
+
+
+def read_device(store, inst, ia, stick_id, by):
+    """Read one device through the stick and record it as source bus -> result."""
+    t0 = time.monotonic()
+    url, stick = stick_check(stick_id)
+    if stick.get("bus_ready") is False:
+        raise StickError("the stick reports no KNX bus (transceiver not ready)")
+    dev = {"address": ia}
+    d = stick_call(url, "knx-describe", {"device": ia})
+    if not d.get("ok"):
+        raise StickError("%s did not answer: %s" % (ia, d.get("error") or "no reply"))
+    for key in ("mask", "lsm"):
+        if d.get(key) is not None:
+            dev[key] = d[key]
+    p = stick_call(url, "knx-prop-read", {"device": ia, "object": 3, "pid": 13})
+    if p.get("ok") and p.get("data"):
+        dev["application_id"] = str(p["data"])
+    for pid, key in ((11, "serial_number"), (15, "order_info")):
+        p = stick_call(url, "knx-prop-read", {"device": ia, "object": 0, "pid": pid,
+                                              "count": 1})
+        v = str(p.get("data") or "") if p.get("ok") else ""
+        if v and set(v.upper()) != {"F"}:        # all FF = never written
+            dev[key] = v
+    t = stick_call(url, "knx-tables-read", {"device": ia})
+    tables_ok = bool(t.get("ok"))
+    if tables_ok:
+        dev["associations"] = t.get("associations") or []
+    ref = "read-device:%s via %s" % (ia, stick_id)
+    claims = inventory_device_claims(ia, dev, ref)
+    read_attrs = {a for kind, _key_, a, _v, _r in claims if kind == "device"}
+    with store.reader() as con:
+        known = load_claims(con, inst, kind="device", keys=[ia], attrs=["serial"], source="bus")
+        links_before = {r["key"] for r in load_claims(con, inst, kind="link", keys=ia + "#*",
+                                                      source="bus")}
+    identity = {"mask": dev.get("mask"), "app_id": dev.get("application_id"),
+                "serial": dev.get("serial_number"), "order_info": dev.get("order_info")}
+    serial_known = known[0]["value"] if known else None
+    if serial_known and dev.get("serial_number") and serial_known != dev["serial_number"]:
+        return {"ok": False, "error": "different_device",
+                "message": "%s answers with serial %s, the record has %s for this address: a "
+                           "different device. Nothing was recorded." % (
+                               ia, dev["serial_number"], serial_known),
+                "identity": identity, "stick": stick}
+
+    def scope(kind, key, attr):
+        # only what this read restated: a property that failed to read ends nothing,
+        # and the links only when the tables were read
+        if kind == "device":
+            return key == ia and attr in read_attrs
+        if kind == "link":
+            return tables_ok and key.split("#", 1)[0] == ia
+        return False
+
+    st = record_import(store, inst, "bus", "read-device", ref, _now_ts(), claims, scope,
+                       by, "data")
+    links_now = ({key for kind, key, _a, _v, _r in claims if kind == "link"}
+                 if tables_ok else links_before)
+    out = {"ok": True, "stick": stick, "identity": identity,
+           "load_state": next((v for kind, _k, a, v, _r in claims if a == "load_state"), None),
+           "links_new": sorted(links_now - links_before, key=_link_sort),
+           "links_gone": sorted(links_before - links_now, key=_link_sort),
+           "links": len(links_now),
+           "recorded": {k: st.get(k) for k in ("asserted", "new", "ended", "reopened")},
+           "took_s": round(time.monotonic() - t0, 1)}
+    if not tables_ok:
+        out["tables_error"] = t.get("error") or "unreadable"
+    return out
+
+
+def _link_sort(key):
+    dev, _, rest = key.partition("#")
+    num, _, ga = rest.partition(">")
+    return (ia_sort(dev), int(num) if num.isdigit() else 0, ga)
+
+
+def _run_read(store, inst, ia, stick_id, by, job):
+    try:
+        res = read_device(store, inst, ia, stick_id, by)
+        state = "done" if res.get("ok") else "failed"
+    except StickError as e:
+        res, state = {"ok": False, "error": "read_failed", "message": str(e)}, "failed"
+    except Exception as e:  # noqa: BLE001 -- the job must end, whatever happened
+        traceback.print_exc()
+        res, state = {"ok": False, "error": "internal", "message": str(e)}, "failed"
+    with _READS_LOCK:
+        job.update(state=state, result=res, finished=_now_ts())
+
+
+def _job_out(job):
+    out = {k: job[k] for k in ("address", "state", "started", "said", "by") if k in job}
+    if job["state"] == "running":
+        out["next"] = "still reading; call proj-read-device with the address only, in ~10 s"
+    else:
+        out["finished"] = job.get("finished")
+        out.update(job.get("result") or {})
+    return out
+
+
+def tool_read_device(store, args, budget):
+    ia = norm_ia(_arg_str(args, "address", 20, required=True))
+    if ia is None:
+        raise ToolError("invalid_reference", "address is a device address like 1.2.3")
+    said = _arg_str(args, "said", 1000)
+    with store.reader() as con:
+        inst = _inst(con, args)
+        res = resolve(load_claims(con, inst, kind="installation", keys=["-"]),
+                      precedence_of(con, inst))
+    stick_id = value_of(res, "stick_id")
+    key = (store.path, inst, ia)
+    now = time.monotonic()
+    with _READS_LOCK:
+        for k_, j in list(_READS.items()):
+            if j["state"] != "running" and now - j["t"] > READ_KEEP_S:
+                del _READS[k_]
+        job = _READS.get(key)
+        if said is None:
+            if job:
+                return _dumps(_job_out(job))
+            return _dumps({"address": ia, "state": None, "stick_id": stick_id,
+                           "next": "nothing read yet. To read the device, call again with "
+                                   "said = the operator's words asking for it."})
+        if job and job["state"] == "running":
+            raise ToolError("read_running", "%s is being read; call again without said "
+                                            "for the result" % ia)
+        if not stick_id:
+            raise ToolError("stick_unknown", "this record names no stick: proj-set "
+                                             "installation stick_id first")
+        job = {"address": ia, "state": "running", "said": said, "by": _caller(args),
+               "started": _now_ts(), "t": now}
+        _READS[key] = job
+    with store.writer() as con:
+        journal(con, inst, _caller(args), "proj-read-device",
+                {"address": ia, "said": said, "stick_id": stick_id}, {"started": True})
+    threading.Thread(target=_run_read, args=(store, inst, ia, stick_id, _caller(args), job),
+                     name="read-%s" % ia, daemon=True).start()
+    return _dumps({"address": ia, "state": "running", "stick_id": stick_id,
+                   "next": "reading in the background (typically 5-30 s); call "
+                           "proj-read-device with the address only for the result"})
 
 
 # -- tool table -------------------------------------------------------------------------
@@ -2477,12 +2748,30 @@ TOOLS = [
          "offset": _OFFSET_PROP,
          "installation": _INST_PROP}},
      "annotations": _RW},
+    {"name": "proj-read-device",
+     "description": (
+         "Read one device over the KNX bus through the installation's stick (stick_id in "
+         "proj-brief) and record what it holds as source 'bus': identity, load state, "
+         "address and association tables. Reads only, never writes a device -- but it puts "
+         "telegrams on a working bus, so only when the operator asked: said quotes them. "
+         "Runs in the background: the call with said starts it, a call with the address "
+         "only returns the result (new and vanished links included). A device that answers "
+         "with another serial number than the record holds is reported, not recorded."),
+     "inputSchema": {"type": "object", "properties": {
+         "address": {"type": "string", "description": "Device address, e.g. 1.2.3"},
+         "said": {"type": "string", "description": "The operator's words asking for the "
+                                                   "read; omit to fetch the result"},
+         "installation": _INST_PROP},
+         "required": ["address"]},
+     "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                     "idempotentHint": False, "openWorldHint": True}},
     {"name": "proj-set",
      "description": (
          "Record a decision of the operator as a claim of source 'user' (it outranks the "
          "imported sources). Only what the operator said or asked for -- said quotes them. "
          "Names, descriptions, locations, datapoint types, the installation description, "
-         "bus_access (which stick or interface reaches its bus) and precedence; and the target state of the installation (device/group present, link "
+         "bus_access (which stick or interface reaches its bus), stick_id (the stick "
+         "proj-read-device uses) and precedence; and the target state of the installation (device/group present, link "
          "present/send, parameter value), which proj-diff a=user b=bus then lists as work "
          "left to do. value null withdraws the operator's earlier decision. Changes the "
          "record only, never the bus."),
@@ -2507,6 +2796,7 @@ TOOL_FUNCS = {
     "proj-history": tool_history,
     "proj-note": tool_note,
     "proj-set": tool_set,
+    "proj-read-device": tool_read_device,
 }
 
 
@@ -3568,6 +3858,11 @@ def serve(cfg):
     atomic_write_json(info_path, {"host": svc.httpd.server_address[0], "port": svc.port,
                                   "pid": os.getpid(), "version": VERSION, "started": _utc_now()})
     svc.start_mdns()
+    global _RESOLVE_IFACE
+    bound = _ip(svc.httpd.server_address[0])
+    if bound is not None and bound.version == 4 and not bound.is_unspecified \
+            and not bound.is_loopback:
+        _RESOLVE_IFACE = str(bound)
 
     def _stop(signum, frame):
         raise KeyboardInterrupt
@@ -3639,9 +3934,16 @@ def build_parser():
     pi = sub.add_parser("init", help="create an installation")
     pm = sub.add_parser("import", help="import data into an installation")
     ph = sub.add_parser("health", help="exit 0 if the running server answers /healthz")
-    for p in (ps, pi, pm, ph):
+    pb = sub.add_parser("backup", help="write a consistent, gzipped copy of the database")
+    pc = sub.add_parser("stick-check", help="find the installation's KNX stick and check "
+                                            "that it answers (no bus traffic)")
+    for p in (ps, pi, pm, ph, pb, pc):
         p.add_argument("--data", help="data directory (KNXPROJECT_DATA, default %s)" % DEFAULT_DATA)
     pi.add_argument("--installation", required=True, help="id: lower-case, digits, - and _")
+    pb.add_argument("dest", help="directory for the copies")
+    pb.add_argument("--keep-days", type=int, default=14,
+                    help="remove copies older than this (default 14)")
+    pc.add_argument("--installation", help="installation id (needed if there are several)")
     pi.add_argument("--name", required=True)
     pm.add_argument("format", choices=IMPORT_FORMATS)
     pm.add_argument("paths", nargs="+")
@@ -3719,6 +4021,61 @@ def _dated(as_of, seen, path):
     return _file_date(path), "file"
 
 
+BACKUP_RE = re.compile(r"^project-(\d{8})-\d{6}\.sqlite\.gz$")
+
+
+def backup_store(store, dest, keep_days=14, now=None):
+    """A consistent copy of the database, gzipped, written atomically into dest and
+    read back; copies older than keep_days are removed.  -> facts."""
+    now = now or datetime.datetime.now()
+    os.makedirs(dest, exist_ok=True)
+    tmp_db = store.path + ".backup.tmp"
+    if os.path.exists(tmp_db):
+        os.remove(tmp_db)
+    try:
+        with store.reader() as con:
+            dst = sqlite3.connect(tmp_db)
+            try:
+                con.backup(dst)
+                check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+            finally:
+                dst.close()
+        if check != "ok":
+            raise StoreError("the copy failed its integrity check: %s" % check)
+        with open(tmp_db, "rb") as f:
+            raw = f.read()
+    finally:
+        if os.path.exists(tmp_db):
+            os.remove(tmp_db)
+    blob = gzip.compress(raw, 6)
+    path = os.path.join(dest, "project-%s.sqlite.gz" % now.strftime("%Y%m%d-%H%M%S"))
+    for _attempt in range(3):
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "wb") as f:
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(dest)
+        with open(path, "rb") as f:
+            back = f.read()
+        try:
+            if gzip.decompress(back) == raw:
+                break
+        except (OSError, EOFError):
+            pass
+    else:
+        raise StoreError("%s does not read back intact" % path)
+    cutoff = (now - datetime.timedelta(days=keep_days)).strftime("%Y%m%d")
+    removed = []
+    for name in sorted(os.listdir(dest)):
+        m = BACKUP_RE.match(name)
+        if m and m.group(1) < cutoff:
+            os.remove(os.path.join(dest, name))
+            removed.append(name)
+    return {"path": path, "bytes": len(blob), "database_bytes": len(raw), "removed": removed}
+
+
 def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, by=None):
     """-> list of (path, stats)."""
     results = []
@@ -3782,6 +4139,24 @@ def main(argv=None):
         if args.cmd == "health":
             return health_check(data)
         store = Store(data)
+        if args.cmd == "backup":
+            r = backup_store(store, os.path.abspath(args.dest), args.keep_days)
+            print("%s: %d bytes (database %d)%s" % (
+                r["path"], r["bytes"], r["database_bytes"],
+                ", removed %s" % " ".join(r["removed"]) if r["removed"] else ""))
+            return 0
+        if args.cmd == "stick-check":
+            with store.reader() as con:
+                inst = _inst(con, {"installation": args.installation})
+                res = resolve(load_claims(con, inst, kind="installation", keys=["-"]),
+                              precedence_of(con, inst))
+            try:
+                _url, facts = stick_check(value_of(res, "stick_id"))
+            except StickError as e:
+                print("knxproject-mcp: %s" % e, file=sys.stderr)
+                return 1
+            print(_dumps(facts))
+            return 0
         if args.cmd == "init":
             create_installation(store, args.installation, args.name)
             print("installation %s created in %s" % (args.installation, store.path))

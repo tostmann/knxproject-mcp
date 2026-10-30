@@ -13,7 +13,9 @@ precedence decides which value counts, the others stay queryable. Claims are
 never deleted: an import that no longer states one ends it.
 
 The writing tools record what the operator decided and what the agent
-inferred. **They never talk to a KNX bus.**
+inferred; they never talk to a KNX bus. One tool does: `proj-read-device`
+reads a device through the installation's busware KNX stick (found by mDNS)
+and records what it holds. It only reads, and only when asked to.
 
 ## Tools
 
@@ -27,7 +29,8 @@ inferred. **They never talk to a KNX bus.**
 | `proj-diff` | compare two sources (e.g. ETS project vs. bus; operator's target vs. bus) |
 | `proj-history` | every claim ever made about an entry; the journal |
 | `proj-note` | notes, findings (open until confirmed), rules, todos |
-| `proj-set` | record a decision of the operator (names, target state) |
+| `proj-set` | record a decision of the operator (names, target state, the stick) |
+| `proj-read-device` | read one device through the installation's stick and record it as `bus` |
 
 The skill `skill://knxproject-mcp/SKILL.md` explains the workflow to the agent.
 
@@ -62,6 +65,20 @@ knxproject_mcp.py import FORMAT PATH... --installation ID [--as-of DATE]
 | `ha-yaml` | `ha` | the `knx:` block of a Home Assistant configuration |
 | `fhem` | `fhem` | `fhem.cfg` files (EIB/KNX devices); dated backups give a time line |
 | `claims` | `--source` | JSON lines `{"ref": "1.2.3#4", "attr": "name", "value": "..."}` |
+
+## Backup
+
+```sh
+knxproject_mcp.py backup DEST [--keep-days 14]
+```
+
+writes a consistent, gzipped copy of the database into `DEST` (read back and
+checked) and removes copies older than `--keep-days`. Run it daily, e.g. from a
+systemd timer with `docker run --rm -v knxproject-data:/data -v /backups:/backup
+knxproject-mcp backup /backup`.
+
+`knxproject_mcp.py stick-check [--installation ID]` finds the installation's
+stick and checks that it answers, without bus traffic.
 
 ## Test
 

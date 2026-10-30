@@ -78,6 +78,17 @@ devices are programmed with the KNX stick's own tools (they default to a dry
 run), only after the operator agreed. After programming, the devices are read
 again and imported as `bus`, and the difference disappears.
 
+**Bring the record up to date with a device.** `proj-read-device` reads one
+device through the installation's stick (`stick_id` in `proj-brief`) and
+records identity, load state and both tables as `bus`. It only reads, but it
+is traffic on a working bus: call it only when the operator asked, with
+`said` = their words. It runs in the background; call it again with the
+address only for the result. `links_new` / `links_gone` say what changed
+since the last bus read. A device that answers with a different serial
+number is reported and not recorded. Do not copy a reply of the stick's own
+read tools into the record by hand; this tool exists so that data never
+passes through you.
+
 **Product knowledge.** `proj-device` gives the `app_id`. If `prod-*` tools are
 available (knxprod-mcp), they explain com objects and parameters of that
 application program.

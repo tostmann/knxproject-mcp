@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -734,7 +735,9 @@ class TestMcp(Base):
             self.assertTrue(t["name"].startswith("proj-"))
             self.assertIn("readOnlyHint", t["annotations"])
         writers = {t["name"] for t in tools if not t["annotations"]["readOnlyHint"]}
-        self.assertEqual(writers, {"proj-note", "proj-set"})
+        self.assertEqual(writers, {"proj-note", "proj-set", "proj-read-device"})
+        open_world = {t["name"] for t in tools if t["annotations"].get("openWorldHint")}
+        self.assertEqual(open_world, {"proj-read-device"})      # the only one with a bus
 
     def test_skill_resource(self):
         res = self.rpc("resources/list")["result"]["resources"]
@@ -828,6 +831,165 @@ class TestCli(Base):
                                      "--data", data]), 2)
         finally:
             sys.stderr = old_err
+
+    def test_backup(self):
+        self.load_all()
+        dest = os.path.join(self.tmp, "backup")
+        os.makedirs(dest)
+        for name in ("project-20000101-000000.sqlite.gz", "notes.txt"):
+            self.path(os.path.join("backup", name), "old")
+        r = k.backup_store(self.store, dest, keep_days=14,
+                           now=datetime.datetime(2026, 10, 30, 3, 30))
+        self.assertEqual(os.path.basename(r["path"]), "project-20261030-033000.sqlite.gz")
+        self.assertEqual(r["removed"], ["project-20000101-000000.sqlite.gz"])
+        self.assertEqual(sorted(os.listdir(dest)),
+                         ["notes.txt", "project-20261030-033000.sqlite.gz"])
+        copy = os.path.join(self.tmp, "copy.sqlite")
+        with open(r["path"], "rb") as f, open(copy, "wb") as g:
+            g.write(gzip.decompress(f.read()))
+        con = k.sqlite3.connect(copy)
+        try:
+            n = con.execute("SELECT count(*) FROM claims").fetchone()[0]
+        finally:
+            con.close()
+        with self.store.reader() as live:
+            self.assertEqual(n, live.execute("SELECT count(*) FROM claims").fetchone()[0])
+        self.assertFalse(os.path.exists(self.store.path + ".backup.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# proj-read-device against a stand-in for the stick's MCP server
+# ---------------------------------------------------------------------------
+
+class FakeStick:
+    """The part of a busware KNX stick's MCP surface proj-read-device uses."""
+
+    def __init__(self):
+        self.stick_id = "0123456789ab"
+        self.serial = "FFF000000001"
+        self.answers = True
+        self.tables_ok = True
+        self.assoc = [{"tsap": 1, "ga": "3/1/7", "com_obj": 0},
+                      {"tsap": 3, "ga": "3/1/9", "com_obj": 5}]
+        self.calls = []
+        fake = self
+
+        class Handler(k.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                msg = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                name = msg["params"]["name"]
+                args = msg["params"]["arguments"]
+                fake.calls.append(name)
+                body = json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {
+                    "content": [{"type": "text", "text": json.dumps(fake.reply(name, args))}],
+                    "isError": False}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.httpd = k.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d/mcp" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def reply(self, name, args):
+        if name == "describe":
+            return {"stick_id": self.stick_id,
+                    "knx": {"own_address": "1.2.250", "tpuart_ready": True}}
+        if name == "knx-describe":
+            return ({"ok": True, "mask": "0x0701", "lsm": [{"idx": 1, "name": "Loaded"}]}
+                    if self.answers else {"ok": False, "error": "not connected"})
+        if name == "knx-prop-read":
+            data = {13: "FFF0123410", 11: self.serial, 15: "FFFFFFFFFFFF"}[args["pid"]]
+            return {"ok": True, "data": data}
+        if name == "knx-tables-read":
+            return ({"ok": True, "associations": self.assoc} if self.tables_ok
+                    else {"ok": False, "error": "timeout"})
+        return {"ok": False, "error": "unknown verb"}
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class TestReadDevice(Base):
+    def setUp(self):
+        super().setUp()
+        self.load_all()
+        self.stick = FakeStick()
+        os.environ["KNXPROJECT_STICK_URL"] = self.stick.url
+
+    def tearDown(self):
+        os.environ.pop("KNXPROJECT_STICK_URL", None)
+        self.stick.close()
+        super().tearDown()
+
+    def call(self, name, args=None, mid=1):
+        return super().call(name, dict(args or {}, _by="test"), mid)
+
+    def read(self, address="1.2.3"):
+        out = self.ok("proj-read-device", {"address": address, "said": "read it"})
+        self.assertEqual(out["state"], "running")
+        for _ in range(200):
+            out = self.ok("proj-read-device", {"address": address})
+            if out["state"] != "running":
+                return out
+            time.sleep(0.02)
+        self.fail("the read did not finish")
+
+    def bus_links(self):
+        with self.store.reader() as con:
+            return {r["key"] for r in k.load_claims(con, "demo", kind="link", keys="1.2.3#*",
+                                                    source="bus")}
+
+    def test_read_records_the_device_as_bus(self):
+        self.assertIsNone(self.ok("proj-read-device", {"address": "1.2.3"})["state"])
+        out, err = self.call("proj-read-device", {"address": "1.2.3", "said": "read it"})
+        self.assertEqual(out["error"], "stick_unknown")
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "01:23:45:67:89:AB", "said": "that stick"})
+        self.assertEqual(self.ok("proj-brief")["stick_id"], "0123456789ab")
+        out = self.read()
+        self.assertEqual(out["state"], "done", out)
+        self.assertEqual(out["links_new"], ["1.2.3#5>3/1/9"])
+        self.assertEqual(out["links_gone"], ["1.2.3#2>3/1/8"])
+        self.assertEqual(self.bus_links(), {"1.2.3#0>3/1/7", "1.2.3#5>3/1/9"})
+        self.assertIsNone(out["identity"]["order_info"])            # all FF: unwritten
+        self.assertEqual(self.stick.calls[:2], ["describe", "knx-describe"])
+        tools = [j["tool"] for j in self.ok("proj-history")["journal"]]
+        self.assertIn("proj-read-device", tools)
+        self.assertIn("import:read-device", tools)
+
+    def test_read_refuses_what_does_not_fit(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "0123456789ab", "said": "that stick"})
+        before = self.bus_links()
+        self.stick.stick_id = "ba9876543210"
+        out = self.read()
+        self.assertEqual(out["state"], "failed")
+        self.assertIn("not this installation's stick", out["message"])
+        self.stick.stick_id = "0123456789ab"
+        self.stick.serial = "FFF000000099"
+        out = self.read()
+        self.assertEqual((out["state"], out["error"]), ("failed", "different_device"))
+        self.stick.serial = "FFF000000001"
+        self.stick.answers = False
+        out = self.read()
+        self.assertIn("did not answer", out["message"])
+        self.assertEqual(self.bus_links(), before)
+        self.stick.answers, self.stick.tables_ok = True, False
+        out = self.read()
+        self.assertEqual((out["state"], out["tables_error"]), ("done", "timeout"))
+        self.assertEqual(self.bus_links(), before)                  # nothing ended
+
+    def test_mdns_resolve_gives_up(self):
+        t0 = time.monotonic()
+        self.assertIsNone(k.mdns_resolve("no-such-stick-here", timeout=0.3))
+        self.assertLess(time.monotonic() - t0, 2.0)
 
 
 if __name__ == "__main__":
