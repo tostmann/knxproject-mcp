@@ -64,7 +64,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -545,6 +545,19 @@ def precedence_of(con, inst):
             return _complete_precedence(val)
     settings = json.loads(installation_row(con, inst)["settings"] or "{}")
     return _complete_precedence(settings.get("precedence") or DEFAULT_PRECEDENCE)
+
+
+LANGUAGES = ("en", "de")      # of the texts from a product pack; the first is the default
+
+
+def language_of(con, inst):
+    """The language proj-device takes the product data's texts in: what the
+    operator set (proj-set installation language), English otherwise."""
+    row = con.execute("SELECT value FROM claims WHERE inst=? AND kind='installation' AND "
+                      "key='-' AND attr='language' AND source='user' AND ended_at IS NULL "
+                      "ORDER BY id DESC LIMIT 1", (inst,)).fetchone()
+    val = json.loads(row[0]) if row is not None else None
+    return val if val in LANGUAGES else LANGUAGES[0]
 
 
 def _complete_precedence(order):
@@ -1672,7 +1685,8 @@ def tool_brief(store, args, budget):
         # the record's own name and description are not decisions about the installation
         user_n = con.execute("SELECT count(*) FROM claims WHERE inst=? AND source='user' AND "
                              "ended_at IS NULL AND NOT (kind='installation' AND attr IN "
-                             "('name', 'description', 'bus_access', 'stick_id'))", (inst,)).fetchone()[0]
+                             "('name', 'description', 'bus_access', 'stick_id', 'language'))",
+                             (inst,)).fetchone()[0]
         rules = [_note_out(con, r, full=False) for r in con.execute(
             "SELECT * FROM notes WHERE inst=? AND kind='rule' AND status IN ('open','confirmed') "
             "ORDER BY id", (inst,))]
@@ -1684,6 +1698,7 @@ def tool_brief(store, args, budget):
             open_n[kind + "s"] = len(rs)
             open_items += [_note_out(con, r, full=False) for r in rs[:BRIEF_OPEN_MAX]]
         pending = _pending_count(con, inst)
+        lang = language_of(con, inst)
     desc = value_of(res, "description") or ""
     access = value_of(res, "bus_access")
     out = {
@@ -1716,6 +1731,8 @@ def tool_brief(store, args, budget):
         "open": dict(open_n, items=open_items),
         "pending_changes": pending,
     }
+    if lang != LANGUAGES[0]:
+        out["language"] = lang
     op = out["open"]
     # over budget: shorten the open items first, then drop the oldest findings
     if _size(out) > budget:
@@ -2103,6 +2120,7 @@ def _device_objects(ia, prec, objs, links, gnames, query, offset, budget):
 
 
 PRODUCT_CANDIDATES = 4      # parameters shown when several share a memory location
+PRODUCT_ALTS = 8            # condition lists (when_any) of the parameters at one location
 
 
 def _mem_address(a):
@@ -2120,9 +2138,9 @@ class _Product:
     the meaning of the value come from here when no source of the record has
     them (a lean record on a stick)."""
 
-    def __init__(self, con, app_id):
+    def __init__(self, con, app_id, lang=LANGUAGES[0]):
         self.con, self.chunks, self.types = con, {}, {}
-        self.prog = None
+        self.prog, self.de = None, lang == "de"
         app = str(app_id or "").upper()
         rows = con.execute("SELECT prog, full_id, layout FROM prod.program WHERE app_id=? AND "
                            "preferred=1 ORDER BY prog", (app,)).fetchall()
@@ -2157,10 +2175,46 @@ class _Product:
         ty = self.types[tid]
         if not ty or ty.get("kind") != "enum" or ty.get("binary") or value is None:
             return None
-        for v, text in ty.get("values", []):
+        for v, text in (ty.get("values_de", []) if self.de else []) + ty.get("values", []):
             if v == "%s" % value:
                 return text
         return None
+
+    def _text(self, b, key):
+        """key of a parameter body in the installation's language: the pack
+        has German beside English where it differs (text_de, block_de, ...)."""
+        return (self.de and b.get(key + "_de")) or b.get(key)
+
+    def _conditions(self, cands):
+        """when / when_any under which one of cands applies: each place the
+        UI shows one of them is a list of conditions (its when and one of its
+        when_any); what all lists share is `when`, the rest `when_any` --
+        knxprod-mcp's own rule for the places of one parameter."""
+        alts, more, cut = [], False, False
+        for b in cands:
+            when, anyof = self._text(b, "when") or [], self._text(b, "when_any") or []
+            for a in ([when + x for x in anyof] if anyof else [when]):
+                if a not in alts:
+                    alts.append(a)
+            more = more or bool(b.get("when_any_more"))
+            cut = cut or bool(b.get("when_more"))
+        if len(alts) <= 1:
+            out = {"when": alts[0]} if alts and alts[0] else {}
+        else:
+            common = [c for c in alts[0] if all(c in a for a in alts[1:])]
+            out = {"when": common} if common else {}
+            rest = []
+            for a in alts:
+                r = [c for c in a if c not in common]
+                if r not in rest:
+                    rest.append(r)
+            if all(rest):
+                out["when_any"] = rest[:PRODUCT_ALTS]
+                if more or len(rest) > PRODUCT_ALTS:
+                    out["when_any_more"] = True
+        if cut and out:
+            out["when_more"] = True
+        return out
 
     def at(self, memory):
         """The product's parameters at this memory location, those of its size
@@ -2185,29 +2239,33 @@ class _Product:
         return sized or cands
 
     def describe(self, memory, value):
-        """-> {path, name, text} when every parameter at this place means the
-        same, {candidates: [...]} when they do not, {} when none lives there."""
+        """-> {path, name, text, when, when_any} when every parameter at this
+        place means the same -- the conditions say when one of them is there
+        at all --, {candidates: [...]} when they do not, {} when none lives
+        there."""
         cands = self.at(memory)
         if not cands:
             return {}
         meanings = []
         for b in cands:
-            m = {"name": b.get("text")}
+            m = {"name": self._text(b, "text")}
             vt = self._value_text(b, value)
             if vt is not None:
                 m["text"] = vt
             meanings.append(m)
         if all(m == meanings[0] for m in meanings):
             out = {}
-            if cands[0].get("block") and all(b.get("block") == cands[0]["block"] for b in cands):
-                out["path"] = cands[0]["block"]
+            path = self._text(cands[0], "block")
+            if path and all(self._text(b, "block") == path for b in cands):
+                out["path"] = path
             out.update(meanings[0])
+            out.update(self._conditions(cands))
             return out
         shown = []
         for b, m in zip(cands[:PRODUCT_CANDIDATES], meanings):
             for k in ("when", "when_any"):
-                if b.get(k):
-                    m[k] = b[k]
+                if self._text(b, k):
+                    m[k] = self._text(b, k)
             shown.append(m)
         out = {"candidates": shown}
         if len(cands) > PRODUCT_CANDIDATES:
@@ -2225,7 +2283,7 @@ def _device_params(con, inst, prec, ia, query, offset, budget):
     prod = None
     if _has_pack(con):
         dres = resolve(load_claims(con, inst, kind="device", keys=[ia], attrs=("app_id",)), prec)
-        prod = _Product(con, value_of(dres, "app_id"))
+        prod = _Product(con, value_of(dres, "app_id"), language_of(con, inst))
     items = []
     for (_k, key), rs in sorted(ents.items(), key=lambda kv: key_sort("param", kv[0][1])):
         res = resolve(rs, prec)
@@ -2238,7 +2296,8 @@ def _device_params(con, inst, prec, ia, query, offset, budget):
                 e[attr] = res[attr]["value"]
             elif attr in extra:
                 e[attr] = extra[attr]
-        for attr in ("candidates", "candidates_total"):
+        for attr in ("when", "when_any", "when_any_more", "when_more", "candidates",
+                     "candidates_total"):
             if attr in extra:
                 e[attr] = extra[attr]
         if res.get("value", {}).get("differs"):
@@ -2255,9 +2314,12 @@ def _device_params(con, inst, prec, ia, query, offset, budget):
         if prod.prog is not None:
             header["product_note"] = (
                 "path, name and text without a source of the record come from the product "
-                "data, found by memory location; candidates: several parameters share that "
-                "location and mean different things, the one whose when (and one when_any) "
-                "holds applies -- the channel modes are parameters of this list too")
+                "data, found by memory location, in the installation's language (proj-set "
+                "installation language: en, de). when (and one of when_any): the product data "
+                "has that parameter there only then -- in another channel mode the location "
+                "may hold another one; check them against this list, the channel modes are "
+                "parameters of it too. candidates: several parameters share that location "
+                "and mean different things; the one whose conditions hold applies")
     return _fill(header, items[offset:], "params", budget, offset, len(items))
 
 
@@ -2670,7 +2732,7 @@ def tool_note(store, args, budget):
 
 _SET_ATTRS = {
     "installation": {"name": "text", "description": "longtext", "precedence": "sources",
-                     "bus_access": "longtext", "stick_id": "stick_id"},
+                     "bus_access": "longtext", "stick_id": "stick_id", "language": "language"},
     "area": {"name": "text", "description": "text"},
     "line": {"name": "text", "description": "text", "medium": "text"},
     "device": {"name": "text", "description": "text", "location": "text", "role": "text",
@@ -2717,6 +2779,11 @@ def _check_value(kind_, vtype, value):
         if not re.match(r"^([0-9A-F]{8}|[0-9A-F]{10})$", v):
             raise ToolError("invalid_value", "an ApplicationId: 8 or 10 hex digits")
         return v
+    if vtype == "language":
+        if value not in LANGUAGES:
+            raise ToolError("invalid_value", "a language of the product data: %s"
+                            % ", ".join(LANGUAGES))
+        return value
     if vtype == "sources":
         if not isinstance(value, list) or not value or any(s not in SOURCES for s in value):
             raise ToolError("invalid_value", "a list of sources: %s" % ", ".join(DEFAULT_PRECEDENCE))
@@ -3213,7 +3280,8 @@ TOOLS = [
          "imported sources). Only what the operator said or asked for -- said quotes them. "
          "Names, descriptions, locations, datapoint types, the installation description, "
          "bus_access (which stick or interface reaches its bus), stick_id (the stick "
-         "proj-read-device uses) and precedence; and the target state of the installation (device/group present, link "
+         "proj-read-device uses), precedence and language (en or de: of the texts "
+         "proj-device takes from the product data); and the target state of the installation (device/group present, link "
          "present/send, parameter value), which proj-diff a=user b=bus then lists as work "
          "left to do. value null withdraws the operator's earlier decision. Changes the "
          "record only, never the bus."),
@@ -4543,9 +4611,9 @@ _FILE_SOURCES = ("ets", "knxproj", "esf", "product")
 def _pack_described(con, inst, prec):
     """The parameter claims the attached product pack says again: (key, attr)
     of a path, name or value text from a project or product file, where the
-    pack gives that parameter one meaning at its memory location -- what
-    proj-device shows when the record has no name -- and names it as the
-    record does, in either language.  Where the names differ, the product
+    pack gives that parameter one meaning at its memory location in every
+    language the stick may show -- what proj-device shows when the record has
+    no name -- and names it as the record does, in either language.  Where the names differ, the product
     data at that place may well be another parameter (one of another channel
     mode the program no longer has there); the record keeps its texts.
     -> (set, facts)."""
@@ -4555,8 +4623,8 @@ def _pack_described(con, inst, prec):
     for (_k, key), rs in sorted(by_entity(load_claims(con, inst, kind="param")).items()):
         app = value_of(devs.get(key.split(":", 1)[0], {}), "app_id")
         if app not in prods:
-            prods[app] = _Product(con, app)
-        prod = prods[app]
+            prods[app] = [_Product(con, app, lang) for lang in LANGUAGES]
+        prod = prods[app][0]
         a = apps.setdefault(str(app or "unknown"), {"parameters": 0, "from_pack": 0,
                                                     "named_otherwise": 0, "product": prod.state})
         a["parameters"] += 1
@@ -4565,17 +4633,18 @@ def _pack_described(con, inst, prec):
                 r["source"] not in _FILE_SOURCES for r in rs if r["attr"] in _PACK_SAYS):
             continue
         memory = res["memory"]["value"]
-        extra = prod.describe(memory, value_of(res, "value"))
-        if "name" not in extra:
+        # what the stick shows in either language of the installation
+        extras = [p.describe(memory, value_of(res, "value")) for p in prods[app]]
+        if any("name" not in x for x in extras):
             continue
         names = {_fold(t) for b in prod.at(memory) for t in (b.get("text"), b.get("text_de")) if t}
         if _fold(str(value_of(res, "name"))) not in names:
             a["named_otherwise"] += 1
             continue
         a["from_pack"] += 1
-        drop.update((key, attr) for attr in _PACK_SAYS if attr in extra)
+        drop.update((key, attr) for attr in _PACK_SAYS if all(attr in x for x in extras))
     return drop, {"applications": apps,
-                  "programs": sorted({p.state for p in prods.values() if p.prog is not None})}
+                  "programs": sorted({p[0].state for p in prods.values() if p[0].prog is not None})}
 
 
 def export_for_stick(store, dest, inst=None):

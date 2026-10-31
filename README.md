@@ -64,8 +64,15 @@ their own in the record and says what their values mean, found by memory
 location in the program of the device's application id. Where several
 parameters share a location and mean different things (union members,
 parameters of another channel mode) the answer lists them as `candidates` with
-the conditions under which each applies. A source of the record (an ETS
-project) always wins over the product data.
+the conditions under which each applies. Where they mean the same, the answer
+gives that meaning with the conditions under which the product data has it
+there at all (`when`, `when_any`): in another channel mode the location may
+hold a parameter the program does not describe there. A source of the record
+(an ETS project) always wins over the product data.
+
+The texts are English. With `proj-set ref=installation attr=language
+value=de` they are German where the pack has German (knxprod-mcp keeps it
+beside the English for names, blocks, value texts and conditions).
 
 ## Import
 
@@ -122,13 +129,14 @@ journal instead of WAL, written atomically and read back. With
 pack says again -- most of a record's rows -- so the stick needs the same pack.
 They stay where the pack names a parameter otherwise than the record does (in
 English or German): at such a place the product data may hold another
-parameter, one of another channel mode, say. Parameters of applications the
-pack lacks keep their texts. The command lists per application how many
-parameters the pack names.
+parameter, one of another channel mode, say. They also stay where the pack
+gives the parameters at that place one name in English but several in German,
+or the other way round. Parameters of applications the pack lacks keep their
+texts. The command lists per application how many parameters the pack names.
 
 On such a record `proj-find` does not find parameters by name;
-`proj-device section=params query=…` does. The pack's names and value texts
-are English, so a record from a German project answers in both languages.
+`proj-device section=params query=…` does. The texts from the pack come in the
+installation's language (above), those the record kept in the record's.
 
 ## Test
 

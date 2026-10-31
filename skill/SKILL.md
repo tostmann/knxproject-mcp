@@ -112,6 +112,10 @@ application program.
   passive observe list. If they do not match, say so instead of acting.
 - A parameter with `ets_only: true` exists only in the ETS project — the device
   does not store it, so it cannot be read back from the device.
+- A parameter named from the product pack (see `product_note` in
+  `proj-device`) is found by its memory location only. Its `when` says under
+  which channel mode the product data has it there; if this list shows that
+  mode set otherwise, the name may be wrong. Say so instead of relying on it.
 - `slot_name` (from `product` data) labels the slot of the application
   program; in another channel mode the same number may do something else.
   Prefer a `name` from `ets` or the operator; check `channel_modes`.

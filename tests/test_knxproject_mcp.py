@@ -1099,7 +1099,8 @@ PACK_SCHEMA = (
 )
 PACK_PARAMS = [
     {"id": "P-1", "text": "Operation mode", "text_de": "Betriebsart", "type": "T-mode",
-     "size_bits": 8, "address": 0x4000, "bit_offset": 0, "block": "Channel A"},
+     "size_bits": 8, "address": 0x4000, "bit_offset": 0, "block": "Channel A",
+     "block_de": "Kanal A"},
     # two union members meaning the same: one answer
     {"id": "P-2", "text": "Delay", "type": "T-time", "size_bits": 8, "address": 0x4001,
      "bit_offset": 0, "block": "Channel A", "union": {"size_bits": 8}},
@@ -1107,16 +1108,33 @@ PACK_PARAMS = [
      "bit_offset": 0, "block": "Channel A", "union": {"size_bits": 8}},
     # two that differ: the agent decides by the conditions
     {"id": "P-4", "text": "Factor (2-255)", "size_bits": 8, "address": 0x4002, "bit_offset": 0,
-     "when": ["Operation mode = 1 (Blind)"]},
+     "when": ["Operation mode = 1 (Blind)"], "when_de": ["Betriebsart = 1 (Jalousie)"]},
     {"id": "P-5", "text": "Factor (5-255)", "size_bits": 8, "address": 0x4002, "bit_offset": 0,
      "when": ["Operation mode = 2 (Roller shutter)"]},
     # a one-bit parameter sharing a byte with another of another size
     {"id": "P-6", "text": "Lock", "type": "T-onoff", "size_bits": 1, "address": 0x4003,
      "bit_offset": 7},
     {"id": "P-7", "text": "Whole byte", "size_bits": 8, "address": 0x4003, "bit_offset": 7},
+    # one meaning, there only in one channel mode: the conditions come along
+    {"id": "P-8", "text": "Slat position", "text_de": "Lamellenstellung", "size_bits": 8,
+     "address": 0x4004, "bit_offset": 0, "block": "Channel A", "block_de": "Kanal A",
+     "when": ["Operation mode = 1 (Blind)"], "when_de": ["Betriebsart = 1 (Jalousie)"]},
+    # one meaning in two modes: what both need is `when`, the rest `when_any`
+    {"id": "P-9", "text": "Status", "size_bits": 8, "address": 0x4005, "bit_offset": 0,
+     "when": ["Channel A active = 1 (on)", "Operation mode = 1 (Blind)"]},
+    {"id": "P-10", "text": "Status", "size_bits": 8, "address": 0x4005, "bit_offset": 0,
+     "when": ["Channel A active = 1 (on)"], "when_any": [["Operation mode = 2 (Roller shutter)"],
+                                                          ["Scene = 1 (on)"]],
+     "when_any_more": True},
+    # one meaning in English, two in German
+    {"id": "P-11", "text": "Brightness", "text_de": "Helligkeit", "size_bits": 8,
+     "address": 0x4006, "bit_offset": 0, "block": "Channel A"},
+    {"id": "P-12", "text": "Brightness", "text_de": "Grundhelligkeit", "size_bits": 8,
+     "address": 0x4006, "bit_offset": 0, "block": "Channel A"},
 ]
 PACK_TYPES = [
-    ("T-mode", {"kind": "enum", "values": [["1", "Blind"], ["2", "Roller shutter"]]}),
+    ("T-mode", {"kind": "enum", "values": [["1", "Blind"], ["2", "Roller shutter"]],
+                "values_de": [["1", "Jalousie"], ["2", "Rollladen"]]}),
     ("T-onoff", {"kind": "enum", "values": [["0", "off"], ["1", "on"]]}),
     ("T-time", {"kind": "enum", "values": [["3", "1 s"], ["4", "1 min"]]}),
 ]
@@ -1154,7 +1172,8 @@ class TestProductPack(Base):
         lines = []
         for ref, addr, bit, size, value in (("P1", "0x4000", 0, 8, 2), ("P2", "0x4001", 0, 8, 4),
                                             ("P3", "0x4002", 0, 8, 9), ("P4", "0x4003", 7, 1, 1),
-                                            ("P5", "0x5000", 0, 8, 0)):
+                                            ("P5", "0x5000", 0, 8, 0), ("P6", "0x4004", 0, 8, 50),
+                                            ("P7", "0x4005", 0, 8, 1), ("P8", "0x4006", 0, 8, 3)):
             lines.append({"ref": "1.2.3:" + ref, "attr": "value", "value": value})
             lines.append({"ref": "1.2.3:" + ref, "attr": "memory",
                           "value": {"address": addr, "bit_offset": bit, "size_bits": size}})
@@ -1184,7 +1203,55 @@ class TestProductPack(Base):
         self.assertEqual((by["P4"]["name"], by["P4"]["text"]), ("Lock", "on"))   # by size
         self.assertNotIn("name", by["P5"])                                       # nothing there
         self.assertEqual(self.params(query="delay")["total"], 1)     # product names searched
-        self.assertEqual(self.params(query="roller")["total"], 2)    # P1's text, P3's when
+        self.assertEqual(self.params(query="roller")["total"], 3)    # P1's text, P3's, P7's when
+
+    def test_one_meaning_comes_with_its_conditions(self):
+        # The product data may keep another channel mode's parameter at a
+        # location: a name alone hid that (Merten, 31.10.: a slat position
+        # named a parameter of a channel in roller shutter mode).
+        by = {p["ref"]: p for p in self.params()["params"]}
+        self.assertEqual({a: by["P6"].get(a) for a in ("path", "name", "when")},
+                         {"path": "Channel A", "name": "Slat position",
+                          "when": ["Operation mode = 1 (Blind)"]})
+        self.assertEqual({a: by["P7"].get(a) for a in ("name", "when", "when_any",
+                                                       "when_any_more")},
+                         {"name": "Status", "when": ["Channel A active = 1 (on)"],
+                          "when_any": [["Operation mode = 1 (Blind)"],
+                                       ["Operation mode = 2 (Roller shutter)"],
+                                       ["Scene = 1 (on)"]],
+                          "when_any_more": True})
+        self.assertFalse({"when", "when_any"} & set(by["P2"]))  # no conditions, none shown
+        self.assertEqual(by["P8"]["name"], "Brightness")
+        out = self.params()
+        self.assertIn("only then", out["product_note"])
+
+    def test_the_installation_language(self):
+        self.assertNotIn("language", self.ok("proj-brief", {}))
+        err, is_err = self.call("proj-set", {"ref": "installation", "attr": "language",
+                                             "value": "fr", "said": "s"})
+        self.assertTrue(is_err)
+        self.assertEqual(err["error"], "invalid_value")
+        self.ok("proj-set", {"ref": "installation", "attr": "language", "value": "de",
+                             "said": "Texte bitte deutsch"})
+        brief = self.ok("proj-brief", {})
+        self.assertEqual(brief["language"], "de")
+        self.assertEqual(brief["decisions_by_user"], 0)    # a setting, not a decision
+        by = {p["ref"]: p for p in self.params()["params"]}
+        self.assertEqual({a: by["P1"].get(a) for a in ("path", "name", "text")},
+                         {"path": "Kanal A", "name": "Betriebsart", "text": "Rollladen"})
+        self.assertEqual((by["P2"]["name"], by["P2"]["text"]), ("Delay", "1 min"))  # no German
+        self.assertEqual(by["P3"]["candidates"][0]["when"], ["Betriebsart = 1 (Jalousie)"])
+        self.assertEqual(by["P3"]["candidates"][1]["when"], ["Operation mode = 2 (Roller shutter)"])
+        self.assertEqual((by["P6"]["name"], by["P6"]["when"]),
+                         ("Lamellenstellung", ["Betriebsart = 1 (Jalousie)"]))
+        self.assertEqual([c["name"] for c in by["P8"]["candidates"]],
+                         ["Helligkeit", "Grundhelligkeit"])
+        self.assertEqual(self.params(query="jalousie")["total"], 2)       # P3's, P6's when
+        self.ok("proj-set", {"ref": "installation", "attr": "language", "value": None,
+                             "said": "doch englisch"})
+        self.assertNotIn("language", self.ok("proj-brief", {}))
+        by = {p["ref"]: p for p in self.params()["params"]}
+        self.assertEqual(by["P1"]["name"], "Operation mode")
 
     def test_what_the_record_knows_wins(self):
         self.ok("proj-set", {"ref": "1.2.3:P1", "attr": "value", "value": 1, "said": "s"})
@@ -1246,6 +1313,7 @@ class TestExportForStick(Base):
                 ("P3", "0x4002", 0, 8, 9, {"name": "Faktor", "path": "Kanal A"}),     # candidates
                 ("P4", "0x4003", 7, 1, 1, {"name": "Lock", "path": "Kanal A", "text": "on"}),
                 ("P7", "0x4000", 0, 8, 1, {"name": "Szene 3", "path": "Kanal B"}),  # another one
+                ("P8", "0x4006", 0, 8, 3, {"name": "Brightness", "path": "Channel A"}),
                 ("P5", "0x5000", 0, 8, 0, {"name": "Reserve"})):                     # nothing there
             lines.append({"ref": "1.2.3:" + ref, "attr": "value", "value": value})
             lines.append({"ref": "1.2.3:" + ref, "attr": "memory",
@@ -1302,6 +1370,18 @@ class TestExportForStick(Base):
         self.assertEqual((by["P7"]["name"], by["P7"]["path"]), ("Szene 3", "Kanal B"))
         self.assertEqual((by["P6"]["name"], by["P6"]["ets_only"]), ("Nur ETS", True))
         self.assertEqual(self.on_stick("1.2.20")["P1"]["name"], "Mode")
+        # one meaning in English, two in German: a German stick would lose the name
+        self.assertEqual((by["P8"]["name"], by["P8"]["path"]), ("Brightness", "Channel A"))
+
+    def test_a_german_installation_reads_german_on_the_stick(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "language", "value": "de",
+                             "said": "deutsch", "installation": "demo"})
+        facts = self.export()
+        self.assertEqual(facts["left_to_the_pack"], 8)
+        by = self.on_stick()
+        self.assertEqual({a: by["P1"].get(a) for a in ("path", "name", "text")},
+                         {"path": "Kanal A", "name": "Betriebsart", "text": "Rollladen"})
+        self.assertEqual(self.ok("proj-brief", {})["language"], "de")
 
     def test_one_installation_in_a_rollback_journal(self):
         self.export()
@@ -1346,7 +1426,7 @@ class TestExportForStick(Base):
             rc = k.main(["export", self.dest, "--data", self.data, "--installation", "demo",
                          "--product-pack", self.pack])
         self.assertEqual(rc, 0)
-        self.assertIn("application FFF0123410: 8 parameters, 3 named by the pack, 1 keep the "
+        self.assertIn("application FFF0123410: 9 parameters, 3 named by the pack, 1 keep the "
                       "record's name", out.getvalue())
 
 
