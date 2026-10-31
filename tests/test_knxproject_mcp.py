@@ -8,6 +8,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -385,6 +386,27 @@ class TestLifecycle(Base):
             r = k.load_claims(con, "demo", keys=["3/1/7"])[0]
         self.assertEqual((r["first_seen"][:4], r["last_seen"][:4]), ("2019", "2022"))
 
+    def test_an_older_import_after_a_newer_one_revives_nothing(self):
+        # review 31.10.: what only the older file states arrives ended, in a later run
+        self.imp("fhem", self.path("fhem.cfg.2024-11-15", FHEM_NEW))
+        st = self.imp("fhem", self.path("fhem.cfg.2014-01-01", FHEM_OLD))[0][1]
+        self.assertEqual((st["new"], st["arrived_ended"], st["ended"]), (0, 1, 0))
+        self.assertEqual(st["record_newer"], "2024-11-15T00:00:00")
+        with self.store.reader() as con:
+            old = k.load_claims(con, "demo", kind="group", keys=["3/1/5"], ended=True)
+            cur = k.load_claims(con, "demo", kind="group", keys=["3/1/7"])
+        self.assertEqual([r["ended_at"] for r in old], ["2024-11-15T00:00:00"])
+        self.assertEqual([r["first_seen"][:10] for r in cur if r["source"] == "fhem"],
+                         ["2014-01-01"])                    # history still extended
+        # the bus likewise: a newer scan, then an older one listing one more device
+        newer = dict(INVENTORY, devices=INVENTORY["devices"][:1])
+        self.imp("inventory", self.path("new.json", json.dumps(newer)), as_of="2026-02-01")
+        self.imp("inventory", self.path("old.json", json.dumps(INVENTORY)), as_of="2026-01-01")
+        with self.store.reader() as con:
+            yes = k.sources_saying(k.load_claims(con, "demo", kind="device", keys=["1.2.20"]),
+                                   "present")
+        self.assertEqual(yes, [])
+
     def test_precedence(self):
         self.load_all()
         with self.store.reader() as con:
@@ -396,6 +418,55 @@ class TestLifecycle(Base):
 
 
 class TestOtherImports(Base):
+    def test_inventory_ends_only_what_an_inventory_states(self):
+        inv = self.path("inv.json", json.dumps(INVENTORY))
+        self.imp("inventory", inv, as_of="2026-01-01")
+        extra = self.path("bus.jsonl", '{"ref": "1.2.3", "attr": "channel_modes", "value": "A"}\n'
+                                       '{"ref": "1.2.3#0", "attr": "size", "value": "1 Bit"}\n')
+        self.imp("claims", extra, as_of="2026-01-02", source="bus")
+        st = self.imp("inventory", inv, as_of="2026-01-03")[0][1]
+        self.assertEqual(st["ended"], 0)
+        with self.store.reader() as con:
+            open_ = {(r["key"], r["attr"]) for r in k.load_claims(con, "demo", source="bus")}
+        self.assertIn(("1.2.3", "channel_modes"), open_)
+        self.assertIn(("1.2.3#0", "size"), open_)
+
+    def test_esf_with_a_byte_order_mark(self):
+        self.imp("esf", self.path("bom.esf", "\ufeff" + ESF, "utf-8"))
+        brief = self.ok_brief()
+        self.assertEqual(brief["installation"]["name"], "Demo")
+
+    def ok_brief(self):
+        r = k.handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "proj-brief", "arguments": {}}}, self.store)
+        return json.loads(r["result"]["content"][0]["text"])
+
+    def test_ha_quoted_hash_and_nested_mappings(self):
+        yaml = ("knx:\n"
+                "  switch:\n"
+                "    - name: \"Dose #1\"  # a comment\n"
+                "      address: \"5/1/1\"\n"
+                "  light:\n"
+                "    - name: RGB\n"
+                "      address: 5/2/1\n"
+                "      individual_colors:\n"
+                "        red:\n"
+                "          address: 5/2/11\n"
+                "          brightness_address: 5/2/12\n"
+                "        green:\n"
+                "          address: [5/2/21]\n"
+                "      state_address:\n"
+                "      - 5/2/2\n")
+        plats = k.parse_ha_knx(yaml)
+        self.assertEqual(plats["switch"][0]["name"], "Dose #1")
+        rgb = plats["light"][0]
+        self.assertEqual((rgb["address"], rgb["state_address"]), ("5/2/1", ["5/2/2"]))
+        self.assertNotIn("brightness_address", rgb)
+        claims, _ref = k.import_ha_yaml(self.path("ha.yaml", yaml))
+        names = {(key, v) for kind, key, a, v, _r in claims if a == "name"}
+        self.assertIn(("5/1/1", "Dose #1"), names)
+        self.assertFalse(any(key in ("5/2/11", "5/2/12", "5/2/21") for _k, key, *_ in claims))
+
     def test_esf_cp1252(self):
         st = self.imp("esf", self.path("x.esf", ESF, "cp1252"))[0][1]
         self.assertGreater(st["new"], 5)
@@ -485,6 +556,56 @@ class TestTools(Base):
     def setUp(self):
         super().setUp()
         self.load_all()
+
+    def test_long_journal_entries_stay_readable(self):
+        self.ok("proj-note", {"text": "x" * 3990, "about": ["3/1/7"]})
+        self.ok("proj-set", {"ref": "installation", "attr": "description", "value": "y" * 7000,
+                             "said": "long"})
+        hist = self.ok("proj-history")["journal"]
+        self.assertTrue(all(isinstance(j["args"], dict) for j in hist[:2]))
+        self.assertTrue(hist[0]["args"]["value"].endswith("…"))
+        self.ok("proj-history", {"ref": "3/1/7"})
+        with self.store.writer() as con:                 # a row an older version cut
+            k.journal(con, "demo", "t", "old", {}, {})
+            con.execute("UPDATE journal SET args=? WHERE id=(SELECT max(id) FROM journal)",
+                        ('{"text":"cut in the mid',))
+        self.assertEqual(self.ok("proj-history")["journal"][0]["args"], '{"text":"cut in the mid')
+
+    def test_long_notes_do_not_break_replies(self):
+        for i in range(4):
+            self.ok("proj-note", {"kind": "rule", "text": ("rule %d " % i) + "r" * 3900,
+                                  "said": "Dirk"})
+        brief = self.ok("proj-brief")
+        self.assertTrue(brief["rules_cut"])
+        self.assertEqual(len(brief["rules"]), 4)
+        for i in range(8):
+            self.ok("proj-note", {"kind": "finding", "text": "f%d " % i + "z" * 3900,
+                                  "about": ["3/1/7", "1.2.3"]})
+        g = self.ok("proj-group", {"ga": "3/1/7"})
+        self.assertTrue(all(n.get("cut") for n in g["notes"]))
+        self.ok("proj-device", {"address": "1.2.3"})
+        offset, claims = 0, 0
+        for _ in range(20):                               # the claims stay reachable
+            h = self.ok("proj-history", {"ref": "3/1/7", "offset": offset})
+            claims += len(h["claims"])
+            if h["next_offset"] is None:
+                break
+            self.assertGreater(h["next_offset"], offset)
+            offset = h["next_offset"]
+        self.assertEqual(claims, h["total"])
+        nid = g["notes"][0]["id"]
+        whole = self.ok("proj-note", {"action": "list", "id": nid})["notes"]
+        self.assertEqual([len(n["text"]) for n in whole], [len("f7 ") + 3900])
+
+    def test_history_names_only_this_reference(self):
+        for ref in ("11.2.3", "1.2.30", "1.2.3#4", "1.2.3"):
+            self.ok("proj-set", {"ref": ref, "attr": "name", "value": "n " + ref, "said": "s"})
+        refs = [j["args"]["ref"] for j in self.ok("proj-history", {"ref": "1.2.3"})["journal"]]
+        self.assertEqual(refs, ["1.2.3"])
+
+    def test_find_knows_the_bus_identity(self):
+        out = self.ok("proj-find", {"query": "FFF000000001"})
+        self.assertIn("1.2.3", [r["ref"] for r in out["results"]])
 
     def test_brief(self):
         out = self.ok("proj-brief")
@@ -631,7 +752,7 @@ class TestTools(Base):
         self.assertIn("COVERING INDEX claims_kind_open", brief)
         find = plan("SELECT " + k._CLAIM_COLS + " FROM claims WHERE inst=? AND attr IN ("
                     + k._FIND_ATTRS_SQL + ") AND ended_at IS NULL", ("demo",))
-        self.assertIn("COVERING INDEX claims_find_v2", find)
+        self.assertIn("COVERING INDEX claims_find_v3", find)
         with self.store.reader() as con:
             via_index = sorted((r["kind"], r["key"], r["attr"])
                                for r in k.load_find_claims(con, "demo"))
@@ -1029,6 +1150,42 @@ class TestReadDevice(Base):
             serial = k.load_claims(con, "demo", kind="device", keys=["1.2.3"],
                                    attrs=["serial"], source="bus")
         self.assertEqual([r["value"] for r in serial], ["FFF000000001"])   # not ended
+
+    def test_a_read_older_than_the_record_ends_nothing(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "0123456789ab", "said": "that stick"})
+        self.imp("inventory", self.path("future.json", json.dumps(INVENTORY)), as_of="2027-01-01")
+        before = self.bus_links()
+        out = self.read()
+        self.assertEqual(out["state"], "done", out)
+        self.assertEqual((out["links_new"], out["links_gone"]), ([], []))
+        self.assertEqual(out["record_newer"], "2027-01-01T00:00:00")
+        self.assertEqual(self.bus_links(), before)
+
+    def test_a_failed_journal_does_not_leave_a_read_running(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "0123456789ab", "said": "that stick"})
+        real = k.journal
+
+        def broken(con, *a, **kw):
+            raise sqlite3.OperationalError("database is locked")
+
+        k.journal = broken
+        try:
+            out, err = self.call("proj-read-device", {"address": "1.2.3", "said": "read it"})
+        finally:
+            k.journal = real
+        self.assertTrue(err)
+        self.assertIsNone(self.ok("proj-read-device", {"address": "1.2.3"})["state"])
+        self.assertEqual(self.read()["state"], "done")
+
+    def test_the_outcome_of_a_read_is_journaled(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "0123456789ab", "said": "that stick"})
+        self.read()
+        hist = self.ok("proj-history", {"ref": "1.2.3"})["journal"]
+        self.assertEqual(hist[0]["tool"], "proj-read-device")
+        self.assertEqual(hist[0]["args"], {"address": "1.2.3", "result": True})
 
     def test_mdns_resolve_gives_up(self):
         t0 = time.monotonic()

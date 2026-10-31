@@ -62,10 +62,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.2.3"
+VERSION = "0.3.0"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
+RULE_CHARS = 400        # a rule's text in the brief when the rules would not fit otherwise
+NOTE_CHARS = 300        # text and said of a note shown with an entry (proj-note list id=N: whole)
+JOURNAL_CHARS = 4000    # a journal entry's args and result, each, as JSON
 DB_NAME = "project.sqlite"
 SERVER_NAME = "knxproject-mcp"
 
@@ -377,7 +380,8 @@ def ref_text(kind, key):
 # the find statement names it as literals: with bound parameters SQLite cannot
 # prove that a query lies within a partial index's WHERE and does not use it.
 _FIND_ATTRS = ("name", "description", "comment", "function", "product", "order_number",
-               "location", "app_name", "text", "path", "role", "fhem_autocreate")
+               "location", "app_name", "text", "path", "role", "fhem_autocreate", "app_id",
+               "serial", "order_info", "slot_name", "dpt", "eis")
 assert all(re.match(r"^[a-z_]+$", a) for a in _FIND_ATTRS)
 _FIND_ATTRS_SQL = ", ".join("'%s'" % a for a in _FIND_ATTRS)
 _CLAIM_COLS = "kind, key, attr, value, source, ref, first_seen, last_seen, ended_at, id"
@@ -404,7 +408,8 @@ _DB_SCHEMA = (
     # the definition: a changed one needs a new name (IF NOT EXISTS would keep the
     # old index, unused) and the old name dropped.
     "DROP INDEX IF EXISTS claims_find_v1",
-    "CREATE INDEX IF NOT EXISTS claims_find_v2 ON claims(inst, kind, key, attr, value, "
+    "DROP INDEX IF EXISTS claims_find_v2",
+    "CREATE INDEX IF NOT EXISTS claims_find_v3 ON claims(inst, kind, key, attr, value, "
     "source, ref, first_seen, last_seen, ended_at) WHERE attr IN (" + _FIND_ATTRS_SQL + ") "
     "AND ended_at IS NULL",
     "CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, inst TEXT NOT NULL, "
@@ -525,14 +530,28 @@ def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=N
     """Assert claims [(kind, key, attr, value, ref)] for `source`, seen at
     `seen`.  `scope(kind, key, attr) -> bool` names what this assertion speaks
     for completely: current claims of the source inside it that were not
-    asserted again end at `seen`.  An assertion older than one already made
-    for the source extends history but ends nothing."""
+    asserted again end at `seen`.  An assertion older than the newest current
+    claim the source holds inside the scope extends history and ends nothing,
+    and what it states for the first time arrives already ended: the newer
+    assertion of the same scope did not state it.  The comparison stays inside
+    the scope, so one device's read does not depend on another device's date."""
     if source not in SOURCES:
         raise StoreError("unknown source %r" % source)
     seen = norm_ts(seen) or _now_ts()
     now = _now_ts()
     asserted = set()
     st = {"asserted": 0, "new": 0, "reopened": 0, "ended": 0}
+    covered, newest = [], None
+    if scope is not None:
+        covered = [r for r in con.execute(
+            "SELECT id, kind, key, attr, last_seen FROM claims WHERE inst=? AND source=? AND "
+            "ended_at IS NULL", (inst, source)).fetchall()
+            if scope(r["kind"], r["key"], r["attr"])]
+        newest = max((r["last_seen"] for r in covered if r["last_seen"]), default=None)
+    stale = newest is not None and seen < newest
+    if stale:
+        st["record_newer"] = newest
+        st["arrived_ended"] = 0
     for kind, key, attr, value, ref in claims:
         if kind not in KINDS:
             raise StoreError("unknown kind %r" % kind)
@@ -541,13 +560,14 @@ def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=N
                           "inst=? AND kind=? AND key=? AND attr=? AND source=? AND value=?",
                           (inst, kind, key, attr, source, vj)).fetchone()
         if row is None:
+            ended = newest if stale and scope(kind, key, attr) else None
             cur = con.execute(
                 "INSERT INTO claims(inst, kind, key, attr, value, source, ref, first_seen, "
                 "last_seen, ended_at, import_id, recorded_at, by) "
-                "VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?)",
-                (inst, kind, key, attr, vj, source, ref, seen, seen, import_id, now, by))
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (inst, kind, key, attr, vj, source, ref, seen, seen, ended, import_id, now, by))
             asserted.add(cur.lastrowid)
-            st["new"] += 1
+            st["arrived_ended" if ended else "new"] += 1
         else:
             first = min(row["first_seen"] or seen, seen)
             last = max(row["last_seen"] or seen, seen)
@@ -560,22 +580,53 @@ def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=N
                         (first, last, ended, import_id, ref, row["id"]))
             asserted.add(row["id"])
         st["asserted"] += 1
-    if scope is not None:
-        newest = con.execute("SELECT max(last_seen) FROM claims WHERE inst=? AND source=? "
-                             "AND ended_at IS NULL", (inst, source)).fetchone()[0]
-        if newest is None or seen >= newest:
-            rows = con.execute("SELECT id, kind, key, attr FROM claims WHERE inst=? AND "
-                               "source=? AND ended_at IS NULL", (inst, source)).fetchall()
-            for r in rows:
-                if r["id"] not in asserted and scope(r["kind"], r["key"], r["attr"]):
-                    con.execute("UPDATE claims SET ended_at=? WHERE id=?", (seen, r["id"]))
-                    st["ended"] += 1
+    if scope is not None and not stale:
+        for r in covered:
+            if r["id"] not in asserted:
+                con.execute("UPDATE claims SET ended_at=? WHERE id=?", (seen, r["id"]))
+                st["ended"] += 1
     return st
+
+
+def _shorten(obj, n=200):
+    """obj with strings cut to n characters and lists to 20 items."""
+    if isinstance(obj, str):
+        return obj if len(obj) <= n else obj[:n] + "…"
+    if isinstance(obj, list):
+        out = [_shorten(x, n) for x in obj[:20]]
+        if len(obj) > 20:
+            out.append("… %d more" % (len(obj) - 20))
+        return out
+    if isinstance(obj, dict):
+        return {k: _shorten(v, n) for k, v in obj.items()}
+    return obj
+
+
+def _journal_text(obj):
+    """obj as JSON for the journal: about JOURNAL_CHARS at most, and JSON always
+    (a cut JSON text could not be read back)."""
+    s = _dumps(obj)
+    if len(s) <= JOURNAL_CHARS:
+        return s
+    s = _dumps(_shorten(obj, 300))
+    if len(s) <= JOURNAL_CHARS:
+        return s
+    return _dumps({"cut": s[:JOURNAL_CHARS - 100]})
+
+
+def _journal_value(text):
+    """A journal column read back; an entry an older version cut stays text."""
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 def journal(con, inst, by, tool, args, result):
     con.execute("INSERT INTO journal(inst, at, by, tool, args, result) VALUES(?,?,?,?,?,?)",
-                (inst, _now_ts(), by, tool, _dumps(args)[:4000], _dumps(result)[:4000]))
+                (inst, _now_ts(), by, tool, _journal_text(args), _journal_text(result)))
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1088,7 @@ _ESF_RE = re.compile(r"^(.*)\.([^.]*)\.(\d{1,2}/\d{1,2}/\d{1,3})$")
 def _read_text(path):
     with open(path, "rb") as f:
         raw = f.read()
-    for enc in ("utf-8", "cp1252"):
+    for enc in ("utf-8-sig", "cp1252"):
         try:
             return raw.decode(enc)
         except UnicodeDecodeError:
@@ -1085,6 +1136,9 @@ def _stick_payload(path):
     if isinstance(data, dict) and isinstance(data.get("result"), dict):
         data = data["result"]                     # a raw MCP/RPC reply
     return data
+
+
+INVENTORY_ATTRS = ("present", "mask", "app_id", "serial", "order_info", "load_state")
 
 
 def inventory_device_claims(ia, d, ref):
@@ -1135,9 +1189,11 @@ def import_inventory(path):
         return ia in listed or any(lo <= ia_sort(ia) <= hi for lo, hi in ranges)
 
     def scope(kind, key, attr):
+        # what an inventory states and nothing else: other bus claims (a read's
+        # channel modes, object sizes from a claims file) are not its to end
         if kind == "device":
-            return covered(key)
-        if kind in ("object", "link"):
+            return attr in INVENTORY_ATTRS and covered(key)
+        if kind == "link":
             return covered(key.split("#", 1)[0])
         return False
 
@@ -1175,10 +1231,12 @@ def import_observe(path):
 
 def _yaml_scalar(s):
     s = s.strip()
+    if s[:1] in ("\"", "'"):                    # a comment may follow, a '#' inside stays
+        end = s.find(s[0], 1)
+        if end > 0:
+            return s[1:end]
     if " #" in s:
         s = s.split(" #", 1)[0].rstrip()
-    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
-        return s[1:-1]
     return s
 
 
@@ -1198,7 +1256,7 @@ def parse_ha_knx(text):
         i += 1
     if base is None:
         raise ImportFailed("no knx: block found")
-    platform, ent, ent_indent, list_key = None, None, None, None
+    platform, ent, ent_indent, list_key, key_indent = None, None, None, None, None
     for ln in lines[i:]:
         if not ln.strip() or ln.lstrip().startswith("#"):
             continue
@@ -1215,14 +1273,23 @@ def parse_ha_knx(text):
             continue
         if body.startswith("- "):
             item = body[2:].strip()
-            if list_key is not None and ent is not None and ind > ent_indent:
-                ent[list_key].append(_yaml_scalar(item))
+            if ent is not None and ind > ent_indent:
+                # a list below one of the entity's keys; one inside a mapping nested
+                # below the entity (list_key None then) is not this block's
+                if list_key is not None:
+                    ent[list_key].append(_yaml_scalar(item))
                 continue
             ent, ent_indent, list_key = {}, ind, None
+            key_indent = ind + 2 + len(body[2:]) - len(body[2:].lstrip())
             out[platform].append(ent)
             body = item
-            ind = ind + 2
+            ind = key_indent
         if ent is None:
+            continue
+        if ind > key_indent:
+            # a mapping nested below an entity key (individual_colors: red: ...):
+            # flattening it would give the entity its children's addresses
+            list_key = None
             continue
         m = re.match(r"^([A-Za-z_][\w]*):\s*(.*)$", body)
         if m:
@@ -1409,7 +1476,7 @@ def _fill(header, items, key, budget, offset=0, total=None):
     used = base
     for i, it in enumerate(items):
         n = _size(it) + 1
-        if used + n > budget:
+        if used + n > budget and i > 0:          # one item always: a page must move on
             out["next_offset"] = offset + i
             break
         out[key].append(it)
@@ -1419,7 +1486,7 @@ def _fill(header, items, key, budget, offset=0, total=None):
     return out
 
 
-def _notes_for(con, inst, refs, status=None, limit=20):
+def _notes_for(con, inst, refs, status=None, limit=20, cap=NOTE_CHARS):
     if not refs:
         return []
     cond = " OR ".join("(r.kind=? AND r.key=?)" for _ in refs)
@@ -1432,19 +1499,30 @@ def _notes_for(con, inst, refs, status=None, limit=20):
         q += " AND n.status IN (%s)" % ",".join("?" * len(status))
         params += list(status)
     q += " ORDER BY n.id DESC LIMIT %d" % limit
-    return [_note_out(con, r) for r in con.execute(q, params)]
+    return [_note_out(con, r, cap=cap) for r in con.execute(q, params)]
 
 
-def _note_out(con, r, full=True):
+def _note_out(con, r, full=True, cap=None):
+    """A note; with cap, text and said cut to cap characters and "cut": true
+    (proj-note action=list id=N gives it whole)."""
     about = [ref_text(x[0], x[1]) for x in con.execute(
         "SELECT kind, key FROM note_refs WHERE note_id=? ORDER BY kind, key", (r["id"],))]
-    e = {"id": r["id"], "kind": r["kind"], "status": r["status"], "text": r["text"]}
+    cut = False
+    text = r["text"]
+    if cap and len(text) > cap:
+        text, cut = text[:cap] + "…", True
+    e = {"id": r["id"], "kind": r["kind"], "status": r["status"], "text": text}
     if about:
         e["about"] = about
     if full:
         if r["said"]:
-            e["said"] = r["said"]
+            said = r["said"]
+            if cap and len(said) > cap:
+                said, cut = said[:cap] + "…", True
+            e["said"] = said
         e["updated"] = r["updated"][:16]
+    if cut:
+        e["cut"] = True
     return e
 
 
@@ -1544,8 +1622,16 @@ def tool_brief(store, args, budget):
     if _size(out) > budget:
         out["description"] = out["description"][:1500] + "…"
     if _size(out) > budget:
+        for r in out["rules"]:
+            if len(r["text"]) > RULE_CHARS:
+                r["text"] = r["text"][:RULE_CHARS] + "…"
+                r["cut"] = True
+                out["rules_cut"] = True
+    if _size(out) > budget:
         out["rules"] = out["rules"][:10]
         out["rules_truncated"] = True
+    if out.get("rules_cut") or out.get("rules_truncated"):
+        out["rules_rest"] = "proj-note action=list kind=rule gives every rule in full"
     shown = len(op["items"])
     if shown < sum(open_n.values()):
         op["items_shown"] = shown
@@ -1563,7 +1649,7 @@ def _pending_count(con, inst):
 
 
 def load_find_claims(con, inst):
-    """The current claims proj-find searches, read from claims_find_v2 alone."""
+    """The current claims proj-find searches, read from claims_find_v3 alone."""
     out = []
     for r in con.execute("SELECT " + _CLAIM_COLS + " FROM claims WHERE inst=? AND attr IN ("
                          + _FIND_ATTRS_SQL + ") AND ended_at IS NULL", (inst,)):
@@ -1604,7 +1690,7 @@ def tool_find(store, args, budget):
         if kinds is None or "note" in kinds:
             for r in con.execute("SELECT * FROM notes WHERE inst=? ORDER BY id DESC", (inst,)):
                 if all(w in _fold(r["text"] + " " + (r["said"] or "")) for w in words):
-                    notes.append(_note_out(con, r, full=False))
+                    notes.append(_note_out(con, r, full=False, cap=NOTE_CHARS))
     hits.sort(key=lambda h: (h[0], key_sort(h[1], h[2])))
     items = []
     for _rank, k, key, rs in hits:
@@ -1774,6 +1860,9 @@ def _group_detail(con, inst, prec, ga, budget):
     if _size(out) > budget:
         out["claims"] = [c for c in out["claims"] if c["attr"] == "name"]
         out["claims_reduced"] = True
+    if _size(out) > budget and len(out["notes"]) > 5:
+        out["notes"] = out["notes"][:5]
+        out["notes_truncated"] = True
     if _size(out) > budget:
         out["links"] = out["links"][:30]
         out["links_truncated"] = True
@@ -1866,6 +1955,9 @@ def tool_device(store, args, budget):
             for g in e["groups"]:
                 g.pop("name", None)
         out["linked_objects_reduced"] = True
+    if _size(out) > budget and len(out["notes"]) > 5:
+        out["notes"] = out["notes"][:5]
+        out["notes_truncated"] = True
     if _size(out) > budget:
         out["linked_objects"] = out["linked_objects"][:20]
         out["linked_objects_truncated"] = True
@@ -2210,18 +2302,30 @@ def tool_history(store, args, budget):
                 "SELECT at, by, tool, args, result FROM journal WHERE inst=? ORDER BY id DESC "
                 "LIMIT 40 OFFSET ?", (inst, offset))]
             for j in js:
-                j["args"] = json.loads(j["args"] or "null")
-                j["result"] = json.loads(j["result"] or "null")
+                j["args"] = _journal_value(j["args"])
+                j["result"] = _journal_value(j["result"])
             return _dumps(_fill({"installation": inst}, js, "journal", budget, offset, total))
         kind, key = ref
         rows = load_claims(con, inst, kind=kind, keys=[key], ended=True)
+        # the entries naming this reference as a JSON string ("ref", "address",
+        # "about"): 1.2.3 is not 11.2.3 or 1.2.30, and _ in a key is no wildcard
+        needle = _dumps(ref_text(kind, key))
+        like = "%" + needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         js = [dict(r) for r in con.execute(
-            "SELECT at, by, tool, args FROM journal WHERE inst=? AND args LIKE ? ORDER BY id "
-            "DESC LIMIT 20", (inst, "%" + key.replace("%", "") + "%"))]
+            "SELECT at, by, tool, args FROM journal WHERE inst=? AND args LIKE ? ESCAPE '\\' "
+            "ORDER BY id DESC LIMIT 20", (inst, like))]
         for j in js:
-            j["args"] = json.loads(j["args"] or "null")
+            j["args"] = _shorten(_journal_value(j["args"]))
         notes = _notes_for(con, inst, [ref], limit=40)
     out = {"ref": ref_text(kind, key), "notes": notes, "journal": js}
+    # the claims are what this view pages; notes and journal must leave them room
+    while _size(out) > budget // 2 and (js or notes):
+        if js:
+            js.pop()
+            out["journal_truncated"] = True
+        else:
+            notes.pop()
+            out["notes_truncated"] = True
     hist = claim_history(rows)
     return _dumps(_fill(out, hist[offset:], "claims", budget, offset, len(hist)))
 
@@ -2236,9 +2340,9 @@ def tool_note(store, args, budget):
     action = _arg_str(args, "action", 20) or "add"
     if action not in ("add", "update", "list"):
         raise ToolError("invalid_argument", "action is add, update or list")
-    with store.writer() as con:
-        inst = _inst(con, args)
-        if action == "list":
+    if action == "list":
+        with store.reader() as con:
+            inst = _inst(con, args)
             kind = _arg_str(args, "kind", 20)
             status = _arg_str(args, "status", 20)
             q, p = "SELECT * FROM notes WHERE inst=?", [inst]
@@ -2248,10 +2352,15 @@ def tool_note(store, args, budget):
             if status:
                 q += " AND status=?"
                 p.append(status)
+            if args.get("id") is not None:
+                q += " AND id=?"
+                p.append(_arg_int(args, "id", 0, 1, 1 << 40))
             notes = [_note_out(con, r) for r in con.execute(q + " ORDER BY id DESC", p)]
             offset = _arg_int(args, "offset", 0, 0, 100000)
-            return _dumps(_fill({"installation": inst}, notes[offset:], "notes", budget,
-                                offset, len(notes)))
+        return _dumps(_fill({"installation": inst}, notes[offset:], "notes", budget,
+                            offset, len(notes)))
+    with store.writer() as con:
+        inst = _inst(con, args)
         about = args.get("about") or []
         if isinstance(about, str):
             about = [about]
@@ -2599,7 +2708,8 @@ def read_device(store, inst, ia, stick_id, by):
     identity = {"mask": dev.get("mask"), "app_id": dev.get("application_id"),
                 "serial": dev.get("serial_number"), "order_info": dev.get("order_info")}
     serial_known = known[0]["value"] if known else None
-    if serial_known and dev.get("serial_number") and serial_known != dev["serial_number"]:
+    if (serial_known and dev.get("serial_number")
+            and str(serial_known).upper() != dev["serial_number"].upper()):
         return {"ok": False, "error": "different_device",
                 "message": "%s answers with serial %s, the record has %s for this address: a "
                            "different device. Nothing was recorded." % (
@@ -2617,8 +2727,11 @@ def read_device(store, inst, ia, stick_id, by):
 
     st = record_import(store, inst, "bus", "read-device", ref, _now_ts(), claims, scope,
                        by, "data")
-    links_now = ({key for kind, key, _a, _v, _r in claims if kind == "link"}
-                 if tables_ok else links_before)
+    # what the record holds now, not what the read said: a read the record
+    # already holds newer bus data for ends nothing (put_claims)
+    with store.reader() as con:
+        links_now = {r["key"] for r in load_claims(con, inst, kind="link", keys=ia + "#*",
+                                                   source="bus")}
     out = {"ok": True, "stick": stick, "identity": identity,
            "load_state": next((v for kind, _k, a, v, _r in claims if a == "load_state"), None),
            "links_new": sorted(links_now - links_before, key=_link_sort),
@@ -2626,6 +2739,10 @@ def read_device(store, inst, ia, stick_id, by):
            "links": len(links_now),
            "recorded": {k: st.get(k) for k in ("asserted", "new", "ended", "reopened")},
            "took_s": round(time.monotonic() - t0, 1)}
+    if st.get("record_newer"):
+        out["record_newer"] = st["record_newer"]
+        out["note"] = ("the record holds bus data of this device dated %s, later than this "
+                       "read: nothing was ended, nothing new made current" % st["record_newer"])
     if not tables_ok:
         out["tables_error"] = t.get("error") or "unreadable"
     if unreadable:
@@ -2648,6 +2765,14 @@ def _run_read(store, inst, ia, stick_id, by, job):
     except Exception as e:  # noqa: BLE001 -- the job must end, whatever happened
         traceback.print_exc()
         res, state = {"ok": False, "error": "internal", "message": str(e)}, "failed"
+    try:                         # journaled before it shows as finished
+        with store.writer() as con:
+            journal(con, inst, by, "proj-read-device", {"address": ia, "result": True},
+                    dict({"state": state}, **{k: res[k] for k in (
+                        "error", "message", "links", "links_new", "links_gone",
+                        "record_newer") if k in res}))
+    except (StoreError, sqlite3.Error):
+        traceback.print_exc()
     with _READS_LOCK:
         job.update(state=state, result=res, finished=_now_ts())
 
@@ -2694,9 +2819,15 @@ def tool_read_device(store, args, budget):
         job = {"address": ia, "state": "running", "said": said, "by": _caller(args),
                "started": _now_ts(), "t": now}
         _READS[key] = job
-    with store.writer() as con:
-        journal(con, inst, _caller(args), "proj-read-device",
-                {"address": ia, "said": said, "stick_id": stick_id}, {"started": True})
+    try:
+        with store.writer() as con:
+            journal(con, inst, _caller(args), "proj-read-device",
+                    {"address": ia, "said": said, "stick_id": stick_id}, {"started": True})
+    except BaseException:
+        with _READS_LOCK:
+            if _READS.get(key) is job:
+                del _READS[key]
+        raise
     threading.Thread(target=_run_read, args=(store, inst, ia, stick_id, _caller(args), job),
                      name="read-%s" % ia, daemon=True).start()
     return _dumps({"address": ia, "state": "running", "stick_id": stick_id,
@@ -2794,7 +2925,8 @@ TOOLS = [
          "(binding for every later conversation; needs said), todo. action=update changes "
          "text/status/about of note id; status confirmed/rejected needs said (the operator's "
          "words). action=list filters by kind/status. about: references (1.2.3, 3/1/7, "
-         "1.2.3#24, installation)."),
+         "1.2.3#24, installation). Notes shown with an entry are cut (\"cut\": true); "
+         "action=list id=N gives one in full."),
      "inputSchema": {"type": "object", "properties": {
          "action": {"type": "string", "enum": ["add", "update", "list"]},
          "id": {"type": "integer"},

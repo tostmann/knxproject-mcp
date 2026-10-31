@@ -69,6 +69,10 @@ evidence in the text. A finding stays `open` until the operator confirms or
 rejects it (`action=update status=confirmed said=...`) or a bus read settles
 it. Never write an inference with `proj-set`.
 
+Notes shown with a device, a group address or a history are cut to a few
+hundred characters (`"cut": true`); `proj-note action=list id=N` gives one in
+full. The brief cuts long rules the same way when they would not fit.
+
 **Plan a change** (a new actuator, a link, a parameter value). Record the
 target state with `proj-set` once the operator asked for it:
 `1.2.12 present=true` plus product/app_id, `1.2.3#24>3/2/20 present=true`,

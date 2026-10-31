@@ -66,6 +66,12 @@ knxproject_mcp.py import FORMAT PATH... --installation ID [--as-of DATE]
 | `fhem` | `fhem` | `fhem.cfg` files (EIB/KNX devices); dated backups give a time line |
 | `claims` | `--source` | JSON lines `{"ref": "1.2.3#4", "attr": "name", "value": "..."}` |
 
+An import speaks for its source as of its date. One older than what the record
+already holds from that source (a backup imported after a newer one) extends
+the history and ends nothing; what only the older file states arrives ended,
+since the newer import did not state it. The import's stats say so
+(`record_newer`, `arrived_ended`).
+
 ## Backup
 
 ```sh
