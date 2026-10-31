@@ -31,7 +31,7 @@ The writing tools change this record only.  They never talk to a KNX bus.
 Every option has an environment fallback: KNXPROJECT_DATA, KNXPROJECT_BIND,
 KNXPROJECT_PORT, KNXPROJECT_ALLOWED_HOSTS, KNXPROJECT_ALLOW_ANY_BIND,
 KNXPROJECT_MDNS, KNXPROJECT_MDNS_NAME, KNXPROJECT_MDNS_HOSTNAME,
-KNXPROJECT_MDNS_ADDRESS.  The server announces itself via mDNS/DNS-SD as
+KNXPROJECT_MDNS_ADDRESS, KNXPROJECT_PRODUCT_PACK.  The server announces itself via mDNS/DNS-SD as
 _knxproject-mcp._tcp (TXT path=/mcp).
 """
 
@@ -59,10 +59,11 @@ import threading
 import time
 import traceback
 import urllib.request
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -431,10 +432,14 @@ class Store:
     """Short-lived connections, one per tool call or import; SQLite in WAL mode
     lets readers run while an import writes."""
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, product_pack=None):
         self.data_dir = os.path.abspath(data_dir)
         os.makedirs(self.data_dir, exist_ok=True)
         self.path = os.path.join(self.data_dir, DB_NAME)
+        self.pack = None
+        if product_pack:
+            check_product_pack(product_pack)
+            self.pack = os.path.abspath(product_pack)
         with self.writer() as con:
             for stmt in _DB_SCHEMA:
                 con.execute(stmt)
@@ -451,6 +456,8 @@ class Store:
         con.execute("PRAGMA busy_timeout=30000")
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA synchronous=FULL")
+        if self.pack:
+            con.execute("ATTACH DATABASE ? AS prod", (self.pack,))
         return con
 
     @contextlib.contextmanager
@@ -483,6 +490,25 @@ class Store:
             n_claims = con.execute("SELECT count(*) FROM claims WHERE ended_at IS NULL"
                                    ).fetchone()[0]
         return {"installations": n_inst, "claims": n_claims}
+
+
+PACK_FORMAT = ("knxprod-pack", "1")
+
+
+def check_product_pack(path):
+    """A product pack of knxprod-mcp (`pack`), format version 1, or StoreError."""
+    if not os.path.isfile(path):
+        raise StoreError("no product pack at %s" % path)
+    con = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path), uri=True)
+    try:
+        meta = dict(con.execute("SELECT key, value FROM meta"))
+    except sqlite3.Error as e:
+        raise StoreError("%s is not a product pack: %s" % (path, e))
+    finally:
+        con.close()
+    if (meta.get("format"), meta.get("version")) != PACK_FORMAT:
+        raise StoreError("%s is not a product pack of format %s version %s"
+                         % ((path,) + PACK_FORMAT))
 
 
 def create_installation(store, inst_id, name, precedence=None):
@@ -1996,16 +2022,140 @@ def _device_objects(ia, prec, objs, links, gnames, query, offset, budget):
     return _fill(header, items[offset:], "objects", budget, offset, len(items))
 
 
+PRODUCT_CANDIDATES = 4      # parameters shown when several share a memory location
+
+
+def _mem_address(a):
+    if isinstance(a, int) and not isinstance(a, bool):
+        return a
+    if isinstance(a, str) and re.match(r"^0[xX][0-9a-fA-F]{1,6}$", a):
+        return int(a, 16)
+    return None
+
+
+class _Product:
+    """What the product data says about a device's parameters: the attached
+    product pack (knxprod-mcp `pack`), searched by where a parameter lives in
+    memory.  The record keeps a parameter's value and location; its name and
+    the meaning of the value come from here when no source of the record has
+    them (a lean record on a stick)."""
+
+    def __init__(self, con, app_id):
+        self.con, self.chunks, self.types = con, {}, {}
+        self.prog = None
+        app = str(app_id or "").upper()
+        rows = con.execute("SELECT prog, full_id, layout FROM prod.program WHERE app_id=? AND "
+                           "preferred=1 ORDER BY prog", (app,)).fetchall()
+        if not rows and app:
+            rows = con.execute("SELECT p.prog, p.full_id, p.layout FROM prod.alias a JOIN "
+                               "prod.program p ON p.prog=a.prog WHERE a.alias=? AND "
+                               "p.preferred=1 ORDER BY p.prog", (app,)).fetchall()
+        if not app:
+            self.state = "the device's application id is not known"
+        elif not rows:
+            self.state = "no product data for application %s" % app
+        elif len({r[2] for r in rows}) > 1:
+            self.state = ("%d programs of different memory layouts report application %s"
+                          % (len(rows), app))
+        else:
+            self.prog, self.state = rows[0][0], rows[0][1]
+
+    def _body(self, kind, n, pos):
+        if (kind, n) not in self.chunks:
+            row = self.con.execute("SELECT body FROM prod.chunk WHERE prog=? AND kind=? AND n=?",
+                                   (self.prog, kind, n)).fetchone()
+            self.chunks[(kind, n)] = json.loads(zlib.decompress(row[0])) if row else []
+        c = self.chunks[(kind, n)]
+        return c[pos] if pos < len(c) else None
+
+    def _value_text(self, body, value):
+        tid = body.get("type")
+        if tid not in self.types:
+            r = self.con.execute("SELECT n, pos FROM prod.item WHERE prog=? AND kind='t' AND id=?",
+                                 (self.prog, tid)).fetchone()
+            self.types[tid] = self._body("t", r[0], r[1]) if r else None
+        ty = self.types[tid]
+        if not ty or ty.get("kind") != "enum" or ty.get("binary") or value is None:
+            return None
+        for v, text in ty.get("values", []):
+            if v == "%s" % value:
+                return text
+        return None
+
+    def describe(self, memory, value):
+        """-> {path, name, text} when every parameter at this place means the
+        same, {candidates: [...]} when they do not, {} when none lives there."""
+        if self.prog is None or not isinstance(memory, dict):
+            return {}
+        bit = memory.get("bit_offset") or 0
+        if memory.get("segment") is not None:           # relative segments (ETS4 and later)
+            rows = self.con.execute(
+                "SELECT n, pos FROM prod.item WHERE prog=? AND kind='p' AND segment=? AND "
+                "seg_offset=? AND bit=? ORDER BY n, pos",
+                (self.prog, memory["segment"], memory.get("offset"), bit)).fetchall()
+        else:
+            addr = _mem_address(memory.get("address"))
+            if addr is None:
+                return {}
+            rows = self.con.execute(
+                "SELECT n, pos FROM prod.item WHERE prog=? AND kind='p' AND address=? AND "
+                "bit=? ORDER BY n, pos", (self.prog, addr, bit)).fetchall()
+        cands = [b for b in (self._body("p", n, pos) for n, pos in rows) if b]
+        sized = [b for b in cands if b.get("size_bits") == memory.get("size_bits")]
+        cands = sized or cands
+        if not cands:
+            return {}
+        meanings = []
+        for b in cands:
+            m = {"name": b.get("text")}
+            vt = self._value_text(b, value)
+            if vt is not None:
+                m["text"] = vt
+            meanings.append(m)
+        if all(m == meanings[0] for m in meanings):
+            out = {}
+            if cands[0].get("block") and all(b.get("block") == cands[0]["block"] for b in cands):
+                out["path"] = cands[0]["block"]
+            out.update(meanings[0])
+            return out
+        shown = []
+        for b, m in zip(cands[:PRODUCT_CANDIDATES], meanings):
+            for k in ("when", "when_any"):
+                if b.get(k):
+                    m[k] = b[k]
+            shown.append(m)
+        out = {"candidates": shown}
+        if len(cands) > PRODUCT_CANDIDATES:
+            out["candidates_total"] = len(cands)
+        return out
+
+
+def _has_pack(con):
+    return any(r[1] == "prod" for r in con.execute("PRAGMA database_list"))
+
+
 def _device_params(con, inst, prec, ia, query, offset, budget):
     ents = by_entity(load_claims(con, inst, kind="param", keys=ia + ":*"))
     words = [w for w in _fold(query or "").split() if w]
+    prod = None
+    if _has_pack(con):
+        dres = resolve(load_claims(con, inst, kind="device", keys=[ia], attrs=("app_id",)), prec)
+        prod = _Product(con, value_of(dres, "app_id"))
     items = []
     for (_k, key), rs in sorted(ents.items(), key=lambda kv: key_sort("param", kv[0][1])):
         res = resolve(rs, prec)
+        extra = {}
+        if prod is not None and "name" not in res and "memory" in res:
+            extra = prod.describe(res["memory"]["value"], value_of(res, "value"))
         e = {"ref": key.split(":", 1)[1]}
         for attr in ("path", "name", "value", "text", "default", "memory", "ets_only"):
             if attr in res:
                 e[attr] = res[attr]["value"]
+            elif attr in extra:
+                e[attr] = extra[attr]
+        for attr in ("candidates", "candidates_total"):
+            if attr in extra:
+                e[attr] = extra[attr]
         if res.get("value", {}).get("differs"):
             e["value_by_source"] = {r["source"]: r["value"] for r in rs if r["attr"] == "value"}
         if words and not all(w in _fold(_dumps(e)) for w in words):
@@ -2015,6 +2165,14 @@ def _device_params(con, inst, prec, ia, query, offset, budget):
               "legend": "value = raw value, text = its meaning; default only where the "
                         "value differs; ets_only = stored in the ETS project, not in the "
                         "device; memory = where the device keeps it"}
+    if prod is not None:
+        header["product"] = prod.state
+        if prod.prog is not None:
+            header["product_note"] = (
+                "path, name and text without a source of the record come from the product "
+                "data, found by memory location; candidates: several parameters share that "
+                "location and mean different things, the one whose when (and one when_any) "
+                "holds applies -- the channel modes are parameters of this list too")
     return _fill(header, items[offset:], "params", budget, offset, len(items))
 
 
@@ -3970,7 +4128,8 @@ def is_any_address(bind):
 MDNS_OFF = {"enabled": False, "name": None, "address": None, "status": "off"}
 
 
-def make_server(bind, port, data_dir, allowed_hosts=(), allow_any_bind=False, activate=True):
+def make_server(bind, port, data_dir, allowed_hosts=(), allow_any_bind=False, activate=True,
+                product_pack=None):
     b = (bind or "").strip()
     if b.startswith("[") and b.endswith("]"):
         b = b[1:-1]
@@ -3992,7 +4151,7 @@ def make_server(bind, port, data_dir, allowed_hosts=(), allow_any_bind=False, ac
     except OSError as e:
         httpd.server_close()
         raise ConfigError("cannot listen on %s port %d: %s" % (b or "*", port, e.strerror or e))
-    httpd.store = Store(data_dir)
+    httpd.store = Store(data_dir, product_pack)
     httpd.extra_hosts = frozenset(normalize_host_entry(h) for h in allowed_hosts)
     httpd.log_line = _print_line
     httpd.mdns_info = lambda: dict(MDNS_OFF)
@@ -4006,7 +4165,7 @@ class Service:
         self.data = os.path.abspath(cfg["data"])
         self.httpd = make_server(cfg["bind"], cfg["port"], self.data,
                                  cfg.get("allowed_hosts", ()), cfg.get("allow_any_bind", False),
-                                 activate=False)
+                                 activate=False, product_pack=cfg.get("product_pack"))
         self.httpd.log_line = self.log
         self.port = self.httpd.server_address[1]
         self.mdns = None
@@ -4156,6 +4315,9 @@ def build_parser():
     ps.add_argument("--mdns-hostname", help="announced host name (KNXPROJECT_MDNS_HOSTNAME)")
     ps.add_argument("--mdns-address", action="append",
                     help="IPv4 address to announce (KNXPROJECT_MDNS_ADDRESS)")
+    ps.add_argument("--product-pack",
+                    help="product data for parameter names and value texts: a pack written by "
+                         "knxprod-mcp (KNXPROJECT_PRODUCT_PACK)")
     return ap
 
 
@@ -4194,6 +4356,7 @@ def resolve_serve_config(args):
             addresses.append(str(ipaddress.IPv4Address(a)))
         except ValueError:
             raise ConfigError("mDNS address must be an IPv4 address: %r" % a)
+    cfg["product_pack"] = args.product_pack or _env("KNXPROJECT_PRODUCT_PACK") or None
     cfg["mdns"] = {"enabled": not args.no_mdns and (_env("KNXPROJECT_MDNS") or "1").lower()
                    not in ("0", "false", "no", "off"),
                    "name": name.strip() if name else None, "hostname": hostname,

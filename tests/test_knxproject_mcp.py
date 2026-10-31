@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -999,6 +1000,148 @@ class TestCli(Base):
 # ---------------------------------------------------------------------------
 # proj-read-device against a stand-in for the stick's MCP server
 # ---------------------------------------------------------------------------
+
+# a product pack as knxprod-mcp writes it (format 1), small enough to read
+PACK_SCHEMA = (
+    "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE program(prog INTEGER PRIMARY KEY, full_id TEXT NOT NULL UNIQUE, "
+    "app_id TEXT NOT NULL, manufacturer TEXT, name TEXT, layout TEXT NOT NULL, "
+    "max_nbytes INTEGER NOT NULL, preferred INTEGER NOT NULL, header BLOB NOT NULL, "
+    "entry TEXT NOT NULL)",
+    "CREATE TABLE alias(alias TEXT NOT NULL, prog INTEGER NOT NULL, PRIMARY KEY(alias, prog)) "
+    "WITHOUT ROWID",
+    "CREATE TABLE chunk(prog INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, "
+    "body BLOB NOT NULL, UNIQUE(prog, kind, n))",
+    "CREATE TABLE item(prog INTEGER NOT NULL, kind TEXT NOT NULL, n INTEGER NOT NULL, "
+    "pos INTEGER NOT NULL, id TEXT NOT NULL, module TEXT, segment TEXT, seg_offset INTEGER, "
+    "address INTEGER, bit INTEGER, size_bits INTEGER, number INTEGER, "
+    "PRIMARY KEY(prog, kind, n, pos)) WITHOUT ROWID",
+    "CREATE INDEX item_id ON item(prog, kind, id)",
+    "CREATE INDEX item_address ON item(prog, address, bit) WHERE kind = 'p' AND address IS NOT NULL",
+)
+PACK_PARAMS = [
+    {"id": "P-1", "text": "Operation mode", "type": "T-mode", "size_bits": 8, "address": 0x4000,
+     "bit_offset": 0, "block": "Channel A"},
+    # two union members meaning the same: one answer
+    {"id": "P-2", "text": "Delay", "type": "T-time", "size_bits": 8, "address": 0x4001,
+     "bit_offset": 0, "block": "Channel A", "union": {"size_bits": 8}},
+    {"id": "P-3", "text": "Delay", "type": "T-time", "size_bits": 8, "address": 0x4001,
+     "bit_offset": 0, "block": "Channel A", "union": {"size_bits": 8}},
+    # two that differ: the agent decides by the conditions
+    {"id": "P-4", "text": "Factor (2-255)", "size_bits": 8, "address": 0x4002, "bit_offset": 0,
+     "when": ["Operation mode = 1 (Blind)"]},
+    {"id": "P-5", "text": "Factor (5-255)", "size_bits": 8, "address": 0x4002, "bit_offset": 0,
+     "when": ["Operation mode = 2 (Roller shutter)"]},
+    # a one-bit parameter sharing a byte with another of another size
+    {"id": "P-6", "text": "Lock", "type": "T-onoff", "size_bits": 1, "address": 0x4003,
+     "bit_offset": 7},
+    {"id": "P-7", "text": "Whole byte", "size_bits": 8, "address": 0x4003, "bit_offset": 7},
+]
+PACK_TYPES = [
+    ("T-mode", {"kind": "enum", "values": [["1", "Blind"], ["2", "Roller shutter"]]}),
+    ("T-onoff", {"kind": "enum", "values": [["0", "off"], ["1", "on"]]}),
+    ("T-time", {"kind": "enum", "values": [["3", "1 s"], ["4", "1 min"]]}),
+]
+
+
+def make_pack(path, app_id="FFF0123410", chunk=2):
+    db = sqlite3.connect(path)
+    for stmt in PACK_SCHEMA:
+        db.execute(stmt)
+    db.executemany("INSERT INTO meta VALUES(?,?)", [("format", "knxprod-pack"), ("version", "1")])
+    db.execute("INSERT INTO program VALUES(1, 'M-FFF0_A-1234-10-ABCD', ?, 'M-FFF0', 'Demo', "
+               "'l1', 1, 1, ?, '{}')", (app_id, zlib.compress(b"{}")))
+    db.execute("INSERT INTO alias VALUES('FFF1123410', 1)")
+    for kind, objs in (("p", [(o["id"], o) for o in PACK_PARAMS]), ("t", PACK_TYPES)):
+        for n in range(0, len(objs), chunk):
+            part = objs[n:n + chunk]
+            db.execute("INSERT INTO chunk VALUES(1,?,?,?)", (kind, n // chunk, zlib.compress(
+                json.dumps([o for _i, o in part]).encode())))
+            for pos, (iid, o) in enumerate(part):
+                db.execute("INSERT INTO item VALUES(1,?,?,?,?,NULL,NULL,NULL,?,?,?,NULL)",
+                           (kind, n // chunk, pos, iid, o.get("address"), o.get("bit_offset"),
+                            o.get("size_bits")))
+    db.commit()
+    db.close()
+    return path
+
+
+class TestProductPack(Base):
+    """A lean record (parameter value and memory location only) reads its
+    parameter names and value texts from a product pack."""
+
+    def setUp(self):
+        super().setUp()
+        self.imp("inventory", self.path("inv.json", json.dumps(INVENTORY)), as_of="2026-08-01")
+        lines = []
+        for ref, addr, bit, size, value in (("P1", "0x4000", 0, 8, 2), ("P2", "0x4001", 0, 8, 4),
+                                            ("P3", "0x4002", 0, 8, 9), ("P4", "0x4003", 7, 1, 1),
+                                            ("P5", "0x5000", 0, 8, 0)):
+            lines.append({"ref": "1.2.3:" + ref, "attr": "value", "value": value})
+            lines.append({"ref": "1.2.3:" + ref, "attr": "memory",
+                          "value": {"address": addr, "bit_offset": bit, "size_bits": size}})
+        lines.append({"ref": "1.2.20:P1", "attr": "value", "value": 1})
+        lines.append({"ref": "1.2.20:P1", "attr": "memory",
+                      "value": {"address": "0x4000", "bit_offset": 0, "size_bits": 8}})
+        self.imp("claims", self.path("p.jsonl", "\n".join(json.dumps(x) for x in lines)),
+                 as_of="2026-08-01", source="ets")
+        self.pack = make_pack(os.path.join(self.tmp, "products.pack"))
+        self.store = k.Store(self.data, self.pack)
+
+    def params(self, address="1.2.3", **kw):
+        return self.ok("proj-device", dict({"address": address, "section": "params"}, **kw))
+
+    def test_names_and_texts_by_memory_location(self):
+        out = self.params()
+        self.assertEqual(out["product"], "M-FFF0_A-1234-10-ABCD")
+        by = {p["ref"]: p for p in out["params"]}
+        self.assertEqual({k_: by["P1"].get(k_) for k_ in ("path", "name", "value", "text")},
+                         {"path": "Channel A", "name": "Operation mode", "value": 2,
+                          "text": "Roller shutter"})
+        self.assertEqual((by["P2"]["name"], by["P2"]["text"]), ("Delay", "1 min"))  # one meaning
+        self.assertEqual([c["name"] for c in by["P3"]["candidates"]],
+                         ["Factor (2-255)", "Factor (5-255)"])
+        self.assertEqual(by["P3"]["candidates"][1]["when"], ["Operation mode = 2 (Roller shutter)"])
+        self.assertNotIn("name", by["P3"])
+        self.assertEqual((by["P4"]["name"], by["P4"]["text"]), ("Lock", "on"))   # by size
+        self.assertNotIn("name", by["P5"])                                       # nothing there
+        self.assertEqual(self.params(query="delay")["total"], 1)     # product names searched
+        self.assertEqual(self.params(query="roller")["total"], 2)    # P1's text, P3's when
+
+    def test_what_the_record_knows_wins(self):
+        self.ok("proj-set", {"ref": "1.2.3:P1", "attr": "value", "value": 1, "said": "s"})
+        jl = self.path("n.jsonl", json.dumps({"ref": "1.2.3:P1", "attr": "name", "value": "Modus"}))
+        self.imp("claims", jl, as_of="2026-08-02", source="ets")
+        p1 = next(p for p in self.params()["params"] if p["ref"] == "P1")
+        self.assertEqual(p1["name"], "Modus")
+        self.assertNotIn("text", p1)                     # no text claim, none invented
+
+    def test_unknown_application_and_alias(self):
+        with self.store.writer() as con:
+            con.execute("UPDATE claims SET value='\"FFF1123410\"' WHERE kind='device' AND "
+                        "key='1.2.20' AND attr='app_id'")
+        self.assertEqual(self.params("1.2.20")["product"], "M-FFF0_A-1234-10-ABCD")
+        with self.store.writer() as con:
+            con.execute("UPDATE claims SET value='\"0C0C0C0C\"' WHERE kind='device' AND "
+                        "key='1.2.20' AND attr='app_id'")
+        out = self.params("1.2.20")
+        self.assertEqual(out["product"], "no product data for application 0C0C0C0C")
+        self.assertNotIn("name", out["params"][0])
+
+    def test_without_a_pack_nothing_changes(self):
+        out = k.Store(self.data)
+        self.store = out
+        res = self.params()
+        self.assertNotIn("product", res)
+        self.assertNotIn("name", res["params"][0])
+
+    def test_a_wrong_pack_is_refused(self):
+        with self.assertRaises(k.StoreError):
+            k.Store(self.data, os.path.join(self.tmp, "missing.pack"))
+        bad = self.path("bad.pack", b"not sqlite at all, not sqlite at all")
+        with self.assertRaises(k.StoreError):
+            k.Store(self.data, bad)
+
 
 class FakeStick:
     """The part of a busware KNX stick's MCP surface proj-read-device uses."""

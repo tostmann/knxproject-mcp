@@ -48,6 +48,25 @@ The server listens on port 8096 (`/mcp`, Streamable HTTP, JSON responses) and
 announces itself via mDNS/DNS-SD as `_knxproject-mcp._tcp`. Keep the data
 directory on a local disk (SQLite locking).
 
+## Product data
+
+A record does not need the product data's descriptions of its parameters: a
+parameter's value and where it lives in the device's memory are enough, when
+the server is given a product pack written by
+[knxprod-mcp](https://github.com/tostmann/knxprod-mcp) (`pack`):
+
+```sh
+knxproject_mcp.py serve --product-pack /data/products.pack   # or KNXPROJECT_PRODUCT_PACK
+```
+
+`proj-device section=params` then names the parameters that have no name of
+their own in the record and says what their values mean, found by memory
+location in the program of the device's application id. Where several
+parameters share a location and mean different things (union members,
+parameters of another channel mode) the answer lists them as `candidates` with
+the conditions under which each applies. A source of the record (an ETS
+project) always wins over the product data.
+
 ## Import
 
 Bulk data is imported with commands, never through the agent:
