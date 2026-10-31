@@ -109,6 +109,27 @@ knxproject-mcp backup /backup`.
 `knxproject_mcp.py stick-check [--installation ID]` finds the installation's
 stick and checks that it answers, without bus traffic.
 
+## A record for a stick
+
+```sh
+knxproject_mcp.py export DEST [--installation ID] [--product-pack PACK]
+```
+
+writes one installation's record as a file a busware KNX stick with a record of
+its own loads (upload on its landing page): only that installation, a rollback
+journal instead of WAL, written atomically and read back. With
+`--product-pack` it leaves out the parameter names, paths and value texts that
+pack says again -- most of a record's rows -- so the stick needs the same pack.
+They stay where the pack names a parameter otherwise than the record does (in
+English or German): at such a place the product data may hold another
+parameter, one of another channel mode, say. Parameters of applications the
+pack lacks keep their texts. The command lists per application how many
+parameters the pack names.
+
+On such a record `proj-find` does not find parameters by name;
+`proj-device section=params query=…` does. The pack's names and value texts
+are English, so a record from a German project answers in both languages.
+
 ## Test
 
 ```sh

@@ -1,5 +1,6 @@
 """Tests for knxproject-mcp.  Every fixture is synthetic and built here."""
 
+import contextlib
 import csv
 import datetime
 import gzip
@@ -1097,8 +1098,8 @@ PACK_SCHEMA = (
     "CREATE INDEX item_address ON item(prog, address, bit) WHERE kind = 'p' AND address IS NOT NULL",
 )
 PACK_PARAMS = [
-    {"id": "P-1", "text": "Operation mode", "type": "T-mode", "size_bits": 8, "address": 0x4000,
-     "bit_offset": 0, "block": "Channel A"},
+    {"id": "P-1", "text": "Operation mode", "text_de": "Betriebsart", "type": "T-mode",
+     "size_bits": 8, "address": 0x4000, "bit_offset": 0, "block": "Channel A"},
     # two union members meaning the same: one answer
     {"id": "P-2", "text": "Delay", "type": "T-time", "size_bits": 8, "address": 0x4001,
      "bit_offset": 0, "block": "Channel A", "union": {"size_bits": 8}},
@@ -1227,6 +1228,126 @@ class TestProductPack(Base):
         bad = self.path("bad.pack", b"not sqlite at all, not sqlite at all")
         with self.assertRaises(k.StoreError):
             k.Store(self.data, bad)
+
+
+class TestExportForStick(Base):
+    """export writes one installation's record for a stick: rollback journal,
+    nothing of another installation, and without what the stick's product pack
+    says again -- the stick then answers as the record does."""
+
+    def setUp(self):
+        super().setUp()
+        self.imp("inventory", self.path("inv.json", json.dumps(INVENTORY)), as_of="2026-08-01")
+        lines = []
+        for ref, addr, bit, size, value, texts in (
+                ("P1", "0x4000", 0, 8, 2, {"name": "Betriebsart", "path": "Kanal A",
+                                           "text": "Rollladen"}),               # in German
+                ("P2", "0x4001", 0, 8, 4, {"name": "Delay", "path": "Channel A", "text": "1 min"}),
+                ("P3", "0x4002", 0, 8, 9, {"name": "Faktor", "path": "Kanal A"}),     # candidates
+                ("P4", "0x4003", 7, 1, 1, {"name": "Lock", "path": "Kanal A", "text": "on"}),
+                ("P7", "0x4000", 0, 8, 1, {"name": "Szene 3", "path": "Kanal B"}),  # another one
+                ("P5", "0x5000", 0, 8, 0, {"name": "Reserve"})):                     # nothing there
+            lines.append({"ref": "1.2.3:" + ref, "attr": "value", "value": value})
+            lines.append({"ref": "1.2.3:" + ref, "attr": "memory",
+                          "value": {"address": addr, "bit_offset": bit, "size_bits": size}})
+            lines += [{"ref": "1.2.3:" + ref, "attr": a, "value": v} for a, v in texts.items()]
+        lines += [{"ref": "1.2.3:P6", "attr": a, "value": v}                       # no memory
+                  for a, v in (("value", 3), ("name", "Nur ETS"), ("ets_only", True))]
+        lines += [{"ref": "1.2.20:P1", "attr": a, "value": v} for a, v in (
+            ("value", 1), ("name", "Operation mode"),
+            ("memory", {"address": "0x4000", "bit_offset": 0, "size_bits": 8}))]
+        self.imp("claims", self.path("p.jsonl", "\n".join(json.dumps(x) for x in lines)),
+                 as_of="2026-08-01", source="ets")
+        # a name another source gives: the parameter keeps all its texts
+        self.imp("claims", self.path("b.jsonl", json.dumps(
+            {"ref": "1.2.20:P1", "attr": "name", "value": "Mode"})), as_of="2026-08-02",
+            source="bus")
+        self.ok("proj-note", {"text": "check P3", "about": ["1.2.3"]})
+        k.create_installation(self.store, "other", "Another house")
+        k.run_import(self.store, "claims", [self.path("o.jsonl", json.dumps(
+            {"ref": "9.9.9", "attr": "name", "value": "elsewhere"}))], "other",
+            as_of="2026-08-01", source="ets")
+        self.ok("proj-note", {"installation": "other", "text": "not for this stick"})
+        self.pack = make_pack(os.path.join(self.tmp, "products.pack"))
+        self.dest = os.path.join(self.tmp, "out", "project.sqlite")
+        os.makedirs(os.path.dirname(self.dest))
+
+    def export(self, pack=True, inst="demo"):
+        return k.export_for_stick(k.Store(self.data, self.pack if pack else None), self.dest,
+                                  inst)
+
+    def on_stick(self, address="1.2.3"):
+        stick = os.path.join(self.tmp, "stick")
+        os.makedirs(stick, exist_ok=True)
+        shutil.copy(self.dest, os.path.join(stick, k.DB_NAME))
+        self.store = k.Store(stick, self.pack)
+        out = self.ok("proj-device", {"address": address, "section": "params"})
+        return {p["ref"]: p for p in out["params"]}
+
+    def test_the_pack_says_the_texts_again(self):
+        facts = self.export()
+        self.assertEqual(facts["left_to_the_pack"], 8)        # P1 3, P2 3, P4 name + text
+        self.assertEqual(facts["applications"]["FFF0123410"]["from_pack"], 3)
+        self.assertEqual(facts["applications"]["FFF0123410"]["named_otherwise"], 1)   # P7
+        self.assertEqual(facts["programs"], ["M-FFF0_A-1234-10-ABCD"])
+        by = self.on_stick()
+        self.assertEqual({a: by["P1"].get(a) for a in ("path", "name", "text")},
+                         {"path": "Channel A", "name": "Operation mode", "text": "Roller shutter"})
+        self.assertEqual((by["P2"]["name"], by["P2"]["text"]), ("Delay", "1 min"))
+        self.assertEqual((by["P3"]["name"], by["P3"]["path"]), ("Faktor", "Kanal A"))
+        self.assertNotIn("candidates", by["P3"])
+        self.assertEqual({a: by["P4"].get(a) for a in ("path", "name", "text")},
+                         {"path": "Kanal A", "name": "Lock", "text": "on"})
+        self.assertEqual(by["P5"]["name"], "Reserve")
+        self.assertEqual((by["P7"]["name"], by["P7"]["path"]), ("Szene 3", "Kanal B"))
+        self.assertEqual((by["P6"]["name"], by["P6"]["ets_only"]), ("Nur ETS", True))
+        self.assertEqual(self.on_stick("1.2.20")["P1"]["name"], "Mode")
+
+    def test_one_installation_in_a_rollback_journal(self):
+        self.export()
+        with open(self.dest, "rb") as f:
+            self.assertEqual(f.read(20)[18:20], b"\x01\x01")
+        db = sqlite3.connect(self.dest)
+        try:
+            self.assertEqual(db.execute("SELECT id FROM installations").fetchall(), [("demo",)])
+            for table in ("imports", "claims", "notes", "journal"):
+                self.assertEqual(db.execute("SELECT count(*) FROM %s WHERE inst IS NOT 'demo'"
+                                            % table).fetchone()[0], 0, table)
+            self.assertEqual(db.execute("SELECT count(*) FROM note_refs WHERE note_id NOT IN "
+                                        "(SELECT id FROM notes)").fetchone()[0], 0)
+            meta = json.loads(db.execute("SELECT v FROM meta WHERE k='export'").fetchone()[0])
+        finally:
+            db.close()
+        self.assertEqual(meta["installation"], "demo")
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.dest))), ["project.sqlite"])
+        self.on_stick()
+        notes = self.ok("proj-note", {"action": "list"})
+        self.assertEqual([n["text"] for n in notes["notes"]], ["check P3"])
+
+    def test_without_a_pack_every_text_stays(self):
+        facts = self.export(pack=False)
+        self.assertNotIn("applications", facts)
+        with self.store.reader() as con:
+            n = con.execute("SELECT count(*) FROM claims WHERE inst='demo'").fetchone()[0]
+        self.assertEqual(facts["claims"], n)
+        self.assertEqual(self.on_stick()["P1"]["name"], "Betriebsart")
+
+    def test_which_installation(self):
+        with self.assertRaises(k.StoreError) as e:
+            self.export(inst=None)
+        self.assertIn("demo, other", str(e.exception))
+        with self.assertRaises(k.StoreError):
+            self.export(inst="nowhere")
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_command_line(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = k.main(["export", self.dest, "--data", self.data, "--installation", "demo",
+                         "--product-pack", self.pack])
+        self.assertEqual(rc, 0)
+        self.assertIn("application FFF0123410: 8 parameters, 3 named by the pack, 1 keep the "
+                      "record's name", out.getvalue())
 
 
 class FakeStick:

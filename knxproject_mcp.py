@@ -64,7 +64,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -2162,11 +2162,11 @@ class _Product:
                 return text
         return None
 
-    def describe(self, memory, value):
-        """-> {path, name, text} when every parameter at this place means the
-        same, {candidates: [...]} when they do not, {} when none lives there."""
+    def at(self, memory):
+        """The product's parameters at this memory location, those of its size
+        if there are any."""
         if self.prog is None or not isinstance(memory, dict):
-            return {}
+            return []
         bit = memory.get("bit_offset") or 0
         if memory.get("segment") is not None:           # relative segments (ETS4 and later)
             rows = self.con.execute(
@@ -2176,13 +2176,18 @@ class _Product:
         else:
             addr = _mem_address(memory.get("address"))
             if addr is None:
-                return {}
+                return []
             rows = self.con.execute(
                 "SELECT n, pos FROM prod.item WHERE prog=? AND kind='p' AND address=? AND "
                 "bit=? ORDER BY n, pos", (self.prog, addr, bit)).fetchall()
         cands = [b for b in (self._body("p", n, pos) for n, pos in rows) if b]
         sized = [b for b in cands if b.get("size_bits") == memory.get("size_bits")]
-        cands = sized or cands
+        return sized or cands
+
+    def describe(self, memory, value):
+        """-> {path, name, text} when every parameter at this place means the
+        same, {candidates: [...]} when they do not, {} when none lives there."""
+        cands = self.at(memory)
         if not cands:
             return {}
         meanings = []
@@ -4378,13 +4383,20 @@ def build_parser():
     pb = sub.add_parser("backup", help="write a consistent, gzipped copy of the database")
     pc = sub.add_parser("stick-check", help="find the installation's KNX stick and check "
                                             "that it answers (no bus traffic)")
-    for p in (ps, pi, pm, ph, pb, pc):
+    pe = sub.add_parser("export", help="write one installation's record as a file a busware "
+                                       "KNX stick loads")
+    for p in (ps, pi, pm, ph, pb, pc, pe):
         p.add_argument("--data", help="data directory (KNXPROJECT_DATA, default %s)" % DEFAULT_DATA)
     pi.add_argument("--installation", required=True, help="id: lower-case, digits, - and _")
     pb.add_argument("dest", help="directory for the copies")
     pb.add_argument("--keep-days", type=int, default=14,
                     help="remove copies older than this (default 14)")
     pc.add_argument("--installation", help="installation id (needed if there are several)")
+    pe.add_argument("dest", help="the file to write, e.g. project.sqlite")
+    pe.add_argument("--installation", help="installation id (needed if there are several)")
+    pe.add_argument("--product-pack",
+                    help="the product pack the stick gets as well: the parameter names, paths "
+                         "and value texts it says again are left out of the file")
     pi.add_argument("--name", required=True)
     pm.add_argument("format", choices=IMPORT_FORMATS)
     pm.add_argument("paths", nargs="+")
@@ -4521,6 +4533,121 @@ def backup_store(store, dest, keep_days=14, now=None):
     return {"path": path, "bytes": len(blob), "database_bytes": len(raw), "removed": removed}
 
 
+# -- a record for a stick ---------------------------------------------------------------
+
+# what a project or product file says about a parameter and a product pack says again
+_PACK_SAYS = ("path", "name", "text")
+_FILE_SOURCES = ("ets", "knxproj", "esf", "product")
+
+
+def _pack_described(con, inst, prec):
+    """The parameter claims the attached product pack says again: (key, attr)
+    of a path, name or value text from a project or product file, where the
+    pack gives that parameter one meaning at its memory location -- what
+    proj-device shows when the record has no name -- and names it as the
+    record does, in either language.  Where the names differ, the product
+    data at that place may well be another parameter (one of another channel
+    mode the program no longer has there); the record keeps its texts.
+    -> (set, facts)."""
+    devs = {key: resolve(rs, prec) for (_k, key), rs in
+            by_entity(load_claims(con, inst, kind="device", attrs=("app_id",))).items()}
+    prods, drop, apps = {}, set(), {}
+    for (_k, key), rs in sorted(by_entity(load_claims(con, inst, kind="param")).items()):
+        app = value_of(devs.get(key.split(":", 1)[0], {}), "app_id")
+        if app not in prods:
+            prods[app] = _Product(con, app)
+        prod = prods[app]
+        a = apps.setdefault(str(app or "unknown"), {"parameters": 0, "from_pack": 0,
+                                                    "named_otherwise": 0, "product": prod.state})
+        a["parameters"] += 1
+        res = resolve(rs, prec)
+        if prod.prog is None or "memory" not in res or "name" not in res or any(
+                r["source"] not in _FILE_SOURCES for r in rs if r["attr"] in _PACK_SAYS):
+            continue
+        memory = res["memory"]["value"]
+        extra = prod.describe(memory, value_of(res, "value"))
+        if "name" not in extra:
+            continue
+        names = {_fold(t) for b in prod.at(memory) for t in (b.get("text"), b.get("text_de")) if t}
+        if _fold(str(value_of(res, "name"))) not in names:
+            a["named_otherwise"] += 1
+            continue
+        a["from_pack"] += 1
+        drop.update((key, attr) for attr in _PACK_SAYS if attr in extra)
+    return drop, {"applications": apps,
+                  "programs": sorted({p.state for p in prods.values() if p.prog is not None})}
+
+
+def export_for_stick(store, dest, inst=None):
+    """One installation's record as a file a busware KNX stick loads: only this
+    installation, a rollback journal instead of WAL (the stick runs SQLite
+    without shared memory), and -- when the store has a product pack -- without
+    the parameter texts that pack says again, which are most of a record's rows.
+    The stick needs the same pack.  Written atomically, read back.  -> facts."""
+    dest = os.path.abspath(dest)
+    tmp = "%s.%d.tmp" % (dest, os.getpid())
+    for p in (tmp, tmp + "-journal"):
+        if os.path.exists(p):
+            os.remove(p)
+    try:
+        with store.reader() as con:
+            try:
+                inst = _inst(con, {"installation": inst} if inst else {})
+            except ToolError as e:
+                names = e.payload.get("installations")
+                raise StoreError(e.payload["message"] + (": " + ", ".join(names) if names
+                                                         else ""))
+            if _has_pack(con):
+                drop, facts = _pack_described(con, inst, precedence_of(con, inst))
+            else:
+                drop, facts = set(), {}
+            dst = sqlite3.connect(tmp, isolation_level=None)
+            try:
+                con.backup(dst)
+            finally:
+                dst.close()
+        dst = sqlite3.connect(tmp, isolation_level=None)
+        try:
+            dst.execute("PRAGMA journal_mode=DELETE")
+            dst.execute("BEGIN")
+            for table in ("imports", "claims", "notes", "journal"):
+                dst.execute("DELETE FROM %s WHERE inst IS NOT ?" % table, (inst,))
+            dst.execute("DELETE FROM note_refs WHERE note_id NOT IN (SELECT id FROM notes)")
+            dst.execute("DELETE FROM installations WHERE id IS NOT ?", (inst,))
+            dst.executemany("DELETE FROM claims WHERE inst=? AND kind='param' AND key=? AND "
+                            "attr=? AND source IN (%s)" % ",".join("?" * len(_FILE_SOURCES)),
+                            [(inst, key, attr) + _FILE_SOURCES for key, attr in sorted(drop)])
+            facts.update({"installation": inst, "at": _utc_now(),
+                          "by": "knxproject-mcp " + VERSION, "left_to_the_pack": len(drop)})
+            dst.execute("INSERT OR REPLACE INTO meta(k, v) VALUES('export', ?)", (_dumps(
+                {k: facts[k] for k in ("at", "by", "installation", "programs") if k in facts}),))
+            dst.execute("COMMIT")
+            dst.execute("VACUUM")
+            claims = dst.execute("SELECT count(*) FROM claims").fetchone()[0]
+        finally:
+            dst.close()
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+        _fsync_dir(os.path.dirname(dest))
+    finally:
+        for p in (tmp, tmp + "-journal"):
+            if os.path.exists(p):
+                os.remove(p)
+    back = sqlite3.connect("file:%s?mode=ro" % dest, uri=True)
+    try:
+        check = back.execute("PRAGMA integrity_check").fetchone()[0]
+        n = back.execute("SELECT count(*) FROM claims").fetchone()[0]
+    finally:
+        back.close()
+    with open(dest, "rb") as f:
+        head = f.read(20)
+    if check != "ok" or n != claims or head[18:20] != b"\x01\x01":
+        raise StoreError("%s does not read back intact" % dest)
+    facts.update({"path": dest, "bytes": os.path.getsize(dest), "claims": claims})
+    return facts
+
+
 def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, by=None):
     """-> list of (path, stats)."""
     results = []
@@ -4584,7 +4711,19 @@ def main(argv=None):
             return serve(resolve_serve_config(args))
         if args.cmd == "health":
             return health_check(data)
-        store = Store(data)
+        store = Store(data, args.product_pack if args.cmd == "export" else None)
+        if args.cmd == "export":
+            r = export_for_stick(store, args.dest, args.installation)
+            print("%s: %d bytes, installation %s, %d claims" % (
+                r["path"], r["bytes"], r["installation"], r["claims"]))
+            if "applications" not in r:
+                print("  no product pack: every parameter keeps its texts")
+            for app, a in sorted(r.get("applications", {}).items()):
+                print("  application %s: %d parameters, %d named by the pack%s (%s)" % (
+                    app, a["parameters"], a["from_pack"],
+                    ", %d keep the record's name, the pack's differs" % a["named_otherwise"]
+                    if a["named_otherwise"] else "", a["product"]))
+            return 0
         if args.cmd == "backup":
             r = backup_store(store, os.path.abspath(args.dest), args.keep_days)
             print("%s: %d bytes (database %d)%s" % (
