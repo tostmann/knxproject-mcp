@@ -46,6 +46,7 @@ import glob
 import gzip
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -70,6 +71,7 @@ BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit
 RULE_CHARS = 400        # a rule's text in the brief when the rules would not fit otherwise
 NOTE_CHARS = 300        # text and said of a note shown with an entry (proj-note list id=N: whole)
 JOURNAL_CHARS = 4000    # a journal entry's args and result, each, as JSON
+ARGS_DEPTH = 32         # how deep a tool's arguments may nest (the stick's port checks it too)
 DB_NAME = "project.sqlite"
 SERVER_NAME = "knxproject-mcp"
 
@@ -137,7 +139,7 @@ def _now_ts():
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?")
+_TS_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?", re.A)
 
 
 def norm_ts(value):
@@ -189,11 +191,13 @@ def _load_json(path, default=None):
 # KNX addresses and the keys of the record
 # ---------------------------------------------------------------------------
 
-_IA_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})$")
-_LINE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})$")
-_GA3_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{1,3})$")
-_GA2_RE = re.compile(r"^(\d{1,2})/(\d{1,4})$")
-_NUM_RE = re.compile(r"^\d{1,5}$")
+# \d with re.A: ASCII digits only -- "٣" is no group address (the stick's port
+# reads ASCII digits, and both must answer alike)
+_IA_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})\.(\d{1,3})$", re.A)
+_LINE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})$", re.A)
+_GA3_RE = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{1,3})$", re.A)
+_GA2_RE = re.compile(r"^(\d{1,2})/(\d{1,4})$", re.A)
+_NUM_RE = re.compile(r"^\d{1,5}$", re.A)
 
 
 def norm_ia(value):
@@ -292,7 +296,7 @@ def key_sort(kind, key):
 
 
 def _natural(s):
-    m = re.search(r"\d+", s)
+    m = re.search(r"\d+", s, re.A)
     return int(m.group(0)) if m else 0
 
 
@@ -664,6 +668,17 @@ def _shorten(obj, n=200):
     if isinstance(obj, dict):
         return {k: _shorten(v, n) for k, v in obj.items()}
     return obj
+
+
+def _depth(x):
+    """How deep a JSON value nests: a scalar 0, {} or [] 1 (iterative)."""
+    deepest, stack = 0, [(x, 1)]
+    while stack:
+        v, d = stack.pop()
+        if isinstance(v, (dict, list)):
+            deepest = max(deepest, d)
+            stack.extend((c, d + 1) for c in (v.values() if isinstance(v, dict) else v))
+    return deepest
 
 
 def _journal_text(obj):
@@ -1504,10 +1519,12 @@ def _arg_str(args, key, maxlen=200, required=False):
 
 def _arg_int(args, key, default, lo, hi):
     v = args.get(key, default)
+    if isinstance(v, str) and not v.strip().isascii():
+        raise ToolError("invalid_argument", "%s must be an integer" % key)  # no "١٢"
     if isinstance(v, bool) or not isinstance(v, int):
         try:
             v = int(v)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):            # OverflowError: inf
             raise ToolError("invalid_argument", "%s must be an integer" % key)
     if not lo <= v <= hi:
         raise ToolError("invalid_argument", "%s must be %d..%d" % (key, lo, hi))
@@ -2589,6 +2606,9 @@ def tool_note(store, args, budget):
             raise ToolError("invalid_argument", "about is a list of references (≤ 40)")
         refs = []
         for a in about:
+            if len(str(a or "").strip()) > 120:              # as a ref argument
+                raise ToolError("invalid_argument",
+                                "a reference in about is at most 120 characters")
             try:
                 refs.append(parse_ref(a))
             except RefError as e:
@@ -2676,7 +2696,7 @@ def _check_value(kind_, vtype, value):
         return value
     if vtype == "dpt":
         if not isinstance(value, str) or not re.match(r"^(DPS?T-)?\d{1,3}([.-]\d{1,3})?$",
-                                                      value.strip(), re.I):
+                                                      value.strip(), re.I | re.A):
             raise ToolError("invalid_value", "a datapoint type like 1.001 or DPST-1-1")
         v = value.strip().upper().replace("DPST-", "").replace("DPT-", "").replace("-", ".")
         main, _, sub = v.partition(".")
@@ -2699,6 +2719,11 @@ def _check_value(kind_, vtype, value):
     if vtype == "scalar":
         if isinstance(value, bool) or not isinstance(value, (int, float, str)):
             raise ToolError("invalid_value", "a number or a string")
+        # a double holds every integer below 2^53 exactly (the stick parses
+        # numbers into doubles), and nothing infinite has a JSON text
+        if not isinstance(value, str) and not (
+                (isinstance(value, int) or math.isfinite(value)) and abs(value) < 2 ** 53):
+            raise ToolError("invalid_value", "a number (below 2^53 in size) or a string")
         return value
     raise ToolError("invalid_value", "unsupported")
 
@@ -3300,6 +3325,9 @@ def handle_rpc(msg, store, notes=None, caller=None):
         try:
             if not isinstance(args, dict):
                 raise ToolError("invalid_argument", "arguments must be an object")
+            if _depth(args) > ARGS_DEPTH:
+                raise ToolError("invalid_argument", "arguments nest deeper than %d levels"
+                                % ARGS_DEPTH)
             args = {k: v for k, v in args.items() if not str(k).startswith("_")}
             if caller:
                 args["_by"] = caller

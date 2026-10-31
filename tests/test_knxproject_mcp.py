@@ -624,6 +624,31 @@ class TestTools(Base):
                         ('{"text":"cut in the mid',))
         self.assertEqual(self.ok("proj-history")["journal"][0]["args"], '{"text":"cut in the mid')
 
+    def test_arguments_the_stick_reads_alike(self):
+        # review of the stick's port (31.10.): inputs on which the two could differ
+        def error(name, args):
+            out, err = self.call(name, args)
+            self.assertTrue(err, out)
+            return out["error"]
+        self.assertEqual(error("proj-note", {"text": "x", "about": ["device:" * 30 + "1.2.3"]}),
+                         "invalid_argument")
+        deep = cur = {}
+        for _ in range(40):
+            cur["a"] = {}
+            cur = cur["a"]
+        self.assertEqual(error("proj-find", {"query": "x", "x": deep}), "invalid_argument")
+        self.assertEqual(error("proj-find", {"query": "x", "offset": "\u0661\u0662"}),
+                         "invalid_argument")
+        self.assertEqual(error("proj-find", {"query": "x", "offset": float("inf")}),
+                         "invalid_argument")
+        self.ok("proj-find", {"query": "x", "offset": 0.5})
+        self.assertEqual(error("proj-group", {"ga": "\u0663/1/7"}), "invalid_argument")
+        for v in (2 ** 53, -2 ** 60, float("inf"), float("nan")):
+            self.assertEqual(error("proj-set", {"ref": "1.2.3:P61", "attr": "value", "value": v,
+                                                "said": "s"}), "invalid_value", v)
+        self.ok("proj-set", {"ref": "1.2.3:P61", "attr": "value", "value": 2 ** 53 - 1,
+                             "said": "s"})
+
     def test_long_notes_do_not_break_replies(self):
         for i in range(4):
             self.ok("proj-note", {"kind": "rule", "text": ("rule %d " % i) + "r" * 3900,
