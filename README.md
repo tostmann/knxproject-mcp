@@ -89,7 +89,11 @@ An import speaks for its source as of its date. One older than what the record
 already holds from that source (a backup imported after a newer one) extends
 the history and ends nothing; what only the older file states arrives ended,
 since the newer import did not state it. The import's stats say so
-(`record_newer`, `arrived_ended`).
+(`record_newer`, `arrived_ended`, `stale_units`). Older is decided per unit:
+per device for bus scans and reads -- a scan also records the address ranges
+it searched (`line … scanned`), so a later scan that found nothing at an
+address counts as newer data for it -- per statement for claims files, and for
+the whole source otherwise.
 
 ## Backup
 

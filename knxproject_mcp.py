@@ -63,7 +63,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -492,7 +492,7 @@ class Store:
         return {"installations": n_inst, "claims": n_claims}
 
 
-PACK_FORMAT = ("knxprod-pack", "1")
+PACK_FORMAT = ("knxprod-pack", "2")       # version 1 was a draft without segments
 
 
 def check_product_pack(path):
@@ -552,41 +552,73 @@ def _complete_precedence(order):
 # claims: writing
 # ---------------------------------------------------------------------------
 
-def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=None):
+def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=None,
+               floor=None):
     """Assert claims [(kind, key, attr, value, ref)] for `source`, seen at
-    `seen`.  `scope(kind, key, attr) -> bool` names what this assertion speaks
-    for completely: current claims of the source inside it that were not
-    asserted again end at `seen`.  An assertion older than the newest current
-    claim the source holds inside the scope extends history and ends nothing,
-    and what it states for the first time arrives already ended: the newer
-    assertion of the same scope did not state it.  The comparison stays inside
-    the scope, so one device's read does not depend on another device's date."""
+    `seen`.  `scope(kind, key, attr)` names what this assertion speaks for
+    completely, unit by unit: it returns the unit a claim belongs to (a device
+    address, say) or True when the whole scope is one unit, and something false
+    outside.  Current claims of the source inside it that were not asserted
+    again end at `seen`.
+
+    Inside a unit for which the record already holds newer data from the source
+    (a later claim, or a later end) the assertion only extends history: it ends
+    nothing, reopens nothing, and what it states for the first time arrives
+    ended at that later date -- the newer assertion did not state it.  Deciding
+    this per unit lets a line scan record a device it alone found although
+    another device on the line was read later.  `floor(con, inst, unit)` adds a date
+    the record holds for a unit without a claim in it: a later scan that covered
+    the address and found nothing there."""
     if source not in SOURCES:
         raise StoreError("unknown source %r" % source)
     seen = norm_ts(seen) or _now_ts()
     now = _now_ts()
     asserted = set()
-    st = {"asserted": 0, "new": 0, "reopened": 0, "ended": 0}
-    covered, newest = [], None
+    st = {"asserted": 0, "new": 0, "reopened": 0, "ended": 0, "arrived_ended": 0}
+    newest, covered = {}, []     # unit -> latest date the source holds in it; open claims
     if scope is not None:
-        covered = [r for r in con.execute(
-            "SELECT id, kind, key, attr, last_seen FROM claims WHERE inst=? AND source=? AND "
-            "ended_at IS NULL", (inst, source)).fetchall()
-            if scope(r["kind"], r["key"], r["attr"])]
-        newest = max((r["last_seen"] for r in covered if r["last_seen"]), default=None)
-    stale = newest is not None and seen < newest
-    if stale:
-        st["record_newer"] = newest
-        st["arrived_ended"] = 0
+        for r in con.execute("SELECT id, kind, key, attr, last_seen, ended_at FROM claims "
+                             "WHERE inst=? AND source=?", (inst, source)).fetchall():
+            u = scope(r["kind"], r["key"], r["attr"])
+            if not u:
+                continue
+            u = "*" if u is True else u
+            d = r["ended_at"] or r["last_seen"]
+            if d and d > newest.get(u, ""):
+                newest[u] = d
+            if r["ended_at"] is None:
+                covered.append((r, u))
+        if floor is not None:                  # before anything of this import is written
+            units = {u for _r, u in covered}
+            for kind, key, attr, _v, _ref in claims:
+                u = scope(kind, key, attr)
+                if u:
+                    units.add("*" if u is True else u)
+            for u in units:
+                f = floor(con, inst, u)
+                if f and f > newest.get(u, ""):
+                    newest[u] = f
+
+    def stale_unit(kind, key, attr):
+        if scope is None:
+            return None
+        u = scope(kind, key, attr)
+        u = "*" if u is True else u
+        return u if u and seen < newest.get(u, "") else None
+
+    stale = set()
     for kind, key, attr, value, ref in claims:
         if kind not in KINDS:
             raise StoreError("unknown kind %r" % kind)
         vj = _dumps(value)
+        su = stale_unit(kind, key, attr)
+        if su:
+            stale.add(su)
         row = con.execute("SELECT id, first_seen, last_seen, ended_at FROM claims WHERE "
                           "inst=? AND kind=? AND key=? AND attr=? AND source=? AND value=?",
                           (inst, kind, key, attr, source, vj)).fetchone()
         if row is None:
-            ended = newest if stale and scope(kind, key, attr) else None
+            ended = newest[su] if su else None
             cur = con.execute(
                 "INSERT INTO claims(inst, kind, key, attr, value, source, ref, first_seen, "
                 "last_seen, ended_at, import_id, recorded_at, by) "
@@ -598,7 +630,7 @@ def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=N
             first = min(row["first_seen"] or seen, seen)
             last = max(row["last_seen"] or seen, seen)
             ended = row["ended_at"]
-            if ended is not None and seen >= ended:
+            if ended is not None and seen >= ended and not su:
                 ended = None
                 st["reopened"] += 1
             con.execute("UPDATE claims SET first_seen=?, last_seen=?, ended_at=?, "
@@ -606,11 +638,17 @@ def put_claims(con, inst, source, claims, seen, import_id=None, by=None, scope=N
                         (first, last, ended, import_id, ref, row["id"]))
             asserted.add(row["id"])
         st["asserted"] += 1
-    if scope is not None and not stale:
-        for r in covered:
-            if r["id"] not in asserted:
-                con.execute("UPDATE claims SET ended_at=? WHERE id=?", (seen, r["id"]))
-                st["ended"] += 1
+    for r, u in covered:
+        if r["id"] in asserted:
+            continue
+        if seen < newest.get(u, ""):
+            stale.add(u)
+            continue
+        con.execute("UPDATE claims SET ended_at=? WHERE id=?", (seen, r["id"]))
+        st["ended"] += 1
+    if stale:
+        st["record_newer"] = max(newest[u] for u in stale)
+        st["stale_units"] = len(stale)
     return st
 
 
@@ -637,7 +675,8 @@ def _journal_text(obj):
     s = _dumps(_shorten(obj, 300))
     if len(s) <= JOURNAL_CHARS:
         return s
-    return _dumps({"cut": s[:JOURNAL_CHARS - 100]})
+    # dumping a JSON text again escapes its quotes: at most twice as long
+    return _dumps({"cut": s[:(JOURNAL_CHARS - 20) // 2]})
 
 
 def _journal_value(text):
@@ -778,7 +817,8 @@ class ImportFailed(Exception):
     pass
 
 
-def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None, date_from=None):
+def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None, date_from=None,
+                  floor=None):
     """date_from: "data" (the input states it), "given" (--as-of) or "file" (only the
     file's modification time is known; the brief then calls the date unknown)."""
     seen = norm_ts(seen) or _now_ts()
@@ -791,7 +831,7 @@ def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None, d
                           (inst, source, fmt, ref, seen, _now_ts(), by or "cli"))
         iid = cur.lastrowid
         st = put_claims(con, inst, source, claims, seen, import_id=iid, by=by or "cli",
-                        scope=scope)
+                        scope=scope, floor=floor)
         st["seen"] = seen
         if date_from:
             st["date_from"] = date_from
@@ -1210,21 +1250,44 @@ def import_inventory(path):
         lo, hi = norm_ia(ln.get("from")), norm_ia(ln.get("to"))
         if lo and hi:
             ranges.append((ia_sort(lo), ia_sort(hi)))
+            # what was searched, found or not: a later scan of an address that
+            # names no device there is newer data about that address too
+            claims.append(("line", lo.rsplit(".", 1)[0], "scanned", "%s-%s" % (lo, hi), ref))
 
     def covered(ia):
         return ia in listed or any(lo <= ia_sort(ia) <= hi for lo, hi in ranges)
 
     def scope(kind, key, attr):
         # what an inventory states and nothing else: other bus claims (a read's
-        # channel modes, object sizes from a claims file) are not its to end
+        # channel modes, object sizes from a claims file) are not its to end.
+        # The unit is the device: a later read of one device makes the scan
+        # stale for that device only.
         if kind == "device":
-            return attr in INVENTORY_ATTRS and covered(key)
+            return key if attr in INVENTORY_ATTRS and covered(key) else False
         if kind == "link":
-            return covered(key.split("#", 1)[0])
+            ia = key.split("#", 1)[0]
+            return ia if covered(ia) else False
         return False
 
     seen = norm_ts(data.get("when") or data.get("at")) if isinstance(data, dict) else None
     return claims, scope, seen, ref
+
+
+def scanned_floor(con, inst, unit):
+    """The latest bus scan that covered the device address `unit`."""
+    ia = norm_ia(unit) if isinstance(unit, str) else None
+    if ia is None:
+        return None
+    best = None
+    for value, last in con.execute(
+            "SELECT value, last_seen FROM claims WHERE inst=? AND kind='line' AND key=? AND "
+            "attr='scanned' AND source='bus' AND ended_at IS NULL",
+            (inst, ia.rsplit(".", 1)[0])):
+        lo, _, hi = json.loads(value).partition("-")
+        if norm_ia(lo) and norm_ia(hi) and ia_sort(lo) <= ia_sort(ia) <= ia_sort(hi) \
+                and last and (best is None or last > best):
+            best = last
+    return best
 
 
 def import_observe(path):
@@ -1408,7 +1471,7 @@ def import_claims_jsonl(path):
     stated = {(k, key, a) for k, key, a, _v, _r in claims}
 
     def scope(kind, key, attr):
-        return (kind, key, attr) in stated
+        return "%s\x1f%s\x1f%s" % (kind, key, attr) if (kind, key, attr) in stated else False
 
     return claims, scope, ref
 
@@ -2878,9 +2941,9 @@ def read_device(store, inst, ia, stick_id, by):
         # only what this read restated: a property that failed to read ends nothing,
         # and the links only when the tables were read
         if kind == "device":
-            return key == ia and attr in read_attrs
+            return ia if key == ia and attr in read_attrs else False
         if kind == "link":
-            return tables_ok and key.split("#", 1)[0] == ia
+            return ia if tables_ok and key.split("#", 1)[0] == ia else False
         return False
 
     st = record_import(store, inst, "bus", "read-device", ref, _now_ts(), claims, scope,
@@ -2895,7 +2958,8 @@ def read_device(store, inst, ia, stick_id, by):
            "links_new": sorted(links_now - links_before, key=_link_sort),
            "links_gone": sorted(links_before - links_now, key=_link_sort),
            "links": len(links_now),
-           "recorded": {k: st.get(k) for k in ("asserted", "new", "ended", "reopened")},
+           "recorded": {k: st.get(k) for k in ("asserted", "new", "ended", "reopened",
+                                               "arrived_ended")},
            "took_s": round(time.monotonic() - t0, 1)}
     if st.get("record_newer"):
         out["record_newer"] = st["record_newer"]
@@ -4460,7 +4524,8 @@ def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, b
     elif fmt == "inventory":
         claims, scope, seen, ref = import_inventory(p)
         ts, date_from = _dated(as_of, seen, p)
-        st = record_import(store, inst, "bus", "inventory", ref, ts, claims, scope, by, date_from)
+        st = record_import(store, inst, "bus", "inventory", ref, ts, claims, scope, by, date_from,
+                           floor=scanned_floor)
     elif fmt == "observe":
         claims, ref = import_observe(p)
         ts, date_from = _dated(as_of, None, p)

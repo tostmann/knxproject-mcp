@@ -408,6 +408,58 @@ class TestLifecycle(Base):
                                    "present")
         self.assertEqual(yes, [])
 
+    def inv(self, devices, as_of, lines=(("1.2.0", "1.2.255"),)):
+        data = {"lines": [{"from": a, "to": b} for a, b in lines], "devices": devices}
+        return self.imp("inventory", self.path("inv-%s.json" % as_of, json.dumps(data)),
+                        as_of=as_of)[0][1]
+
+    def bus(self, ia, attr):
+        with self.store.reader() as con:
+            return sorted((r["value"], r["ended_at"]) for r in k.load_claims(
+                con, "demo", kind="device", keys=[ia], attrs=[attr], source="bus", ended=True))
+
+    def test_a_stale_import_reopens_nothing(self):
+        # review 31.10. (A1): an older scan restating a value a newer one ended
+        dev = lambda app: [{"address": "1.2.5", "application_id": app}]
+        self.inv(dev("AAAA"), "2026-01-01")
+        self.inv(dev("BBBB"), "2026-02-01")
+        self.inv(dev("BBBB"), "2026-03-01")
+        st = self.inv(dev("AAAA"), "2026-02-15")
+        self.assertEqual((st["reopened"], st["record_newer"]), (0, "2026-03-01T00:00:00"))
+        self.assertEqual(self.bus("1.2.5", "app_id"),
+                         [("AAAA", "2026-02-01T00:00:00"), ("BBBB", None)])
+
+    def test_staleness_is_per_device(self):
+        # review 31.10. (A2): one device read later does not make the whole scan stale
+        self.inv([{"address": "1.2.5", "application_id": "AAAA"}], "2026-01-10")
+        with self.store.writer() as con:          # a read of 1.2.5 alone, later
+            k.put_claims(con, "demo", "bus", [("device", "1.2.5", "app_id", "AAAA", None)],
+                         "2026-03-01", scope=lambda kd, key, a: "1.2.5" if key == "1.2.5" else False)
+        st = self.inv([{"address": "1.2.5", "application_id": "AAAA"},
+                       {"address": "1.2.6", "application_id": "FFFF"}], "2026-02-20")
+        self.assertEqual(self.bus("1.2.6", "app_id"), [("FFFF", None)])          # recorded
+        self.assertEqual(self.bus("1.2.5", "app_id"), [("AAAA", None)])
+        self.assertEqual(st["stale_units"], 1)
+
+    def test_a_later_scan_that_found_nothing_counts(self):
+        # the newer scan covered 1.2.20 and did not find it: an older scan that
+        # did cannot make it present again -- nor an older import after its end (A3)
+        self.inv([{"address": "1.2.3", "application_id": "AAAA"}], "2026-02-01")
+        st = self.inv([{"address": "1.2.3", "application_id": "AAAA"},
+                       {"address": "1.2.20", "application_id": "CCCC"}], "2026-01-01")
+        self.assertEqual(self.bus("1.2.20", "present"), [(True, "2026-02-01T00:00:00")])
+        self.assertEqual(st["new"], 0)
+        self.inv([{"address": "1.2.7", "application_id": "EEEE"}], "2026-03-01")
+        self.inv([], "2026-04-01")                       # 1.2.7 gone
+        self.inv([{"address": "1.2.7", "application_id": "EEEE"}], "2026-03-15")
+        self.assertEqual(self.bus("1.2.7", "present"), [(True, "2026-04-01T00:00:00")])
+
+    def test_journal_text_keeps_its_cap(self):
+        # strings under the shortening limit, no lists: only the last resort cuts
+        text = k._journal_text({"k%d" % i: '"' * 250 for i in range(40)})
+        self.assertLessEqual(len(text), k.JOURNAL_CHARS)
+        json.loads(text)
+
     def test_precedence(self):
         self.load_all()
         with self.store.reader() as con:
@@ -1048,7 +1100,7 @@ def make_pack(path, app_id="FFF0123410", chunk=2):
     db = sqlite3.connect(path)
     for stmt in PACK_SCHEMA:
         db.execute(stmt)
-    db.executemany("INSERT INTO meta VALUES(?,?)", [("format", "knxprod-pack"), ("version", "1")])
+    db.executemany("INSERT INTO meta VALUES(?,?)", [("format", "knxprod-pack"), ("version", "2")])
     db.execute("INSERT INTO program VALUES(1, 'M-FFF0_A-1234-10-ABCD', ?, 'M-FFF0', 'Demo', "
                "'l1', 1, 1, ?, '{}')", (app_id, zlib.compress(b"{}")))
     db.execute("INSERT INTO alias VALUES('FFF1123410', 1)")
@@ -1134,6 +1186,15 @@ class TestProductPack(Base):
         res = self.params()
         self.assertNotIn("product", res)
         self.assertNotIn("name", res["params"][0])
+
+    def test_a_first_draft_pack_is_refused(self):
+        old = make_pack(os.path.join(self.tmp, "v1.pack"))
+        db = sqlite3.connect(old)
+        db.execute("UPDATE meta SET value='1' WHERE key='version'")
+        db.commit()
+        db.close()
+        with self.assertRaises(k.StoreError):
+            k.Store(self.data, old)
 
     def test_a_wrong_pack_is_refused(self):
         with self.assertRaises(k.StoreError):
