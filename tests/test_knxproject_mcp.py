@@ -1564,6 +1564,18 @@ class TestReadDevice(Base):
         out = self.read()
         self.assertEqual((out["state"], out["tables_error"]), ("done", "timeout"))
         self.assertEqual(self.bus_links(), before)                  # nothing ended
+        # a stick that sends its associations as anything but a list: not a
+        # reading of the tables, nothing ended (before: an exception, "internal")
+        self.stick.tables_ok = True
+        for bad in ({"0": {"ga": "3/1/7", "com_obj": 0}}, "3/1/7"):
+            self.stick.assoc = bad
+            out = self.read()
+            self.assertEqual((out["state"], out["tables_error"]), ("done", "unreadable"), out)
+            self.assertEqual(self.bus_links(), before)
+        self.stick.assoc = [{"ga": "3/1/7", "com_obj": 0}, "3/1/9", None]
+        out = self.read()
+        self.assertEqual(out["state"], "done", out)
+        self.assertIn("1.2.3#0>3/1/7", self.bus_links())            # the one object counts
 
     def test_a_repeated_answer_is_not_taken_for_another_property(self):
         self.ok("proj-set", {"ref": "installation", "attr": "stick_id",

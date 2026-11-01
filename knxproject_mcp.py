@@ -1249,7 +1249,10 @@ def inventory_device_claims(ia, d, ref):
         claims.append(("device", ia, "load_state",
                        " ".join("%s:%s" % (x.get("idx"), x.get("name")) for x in lsm
                                 if isinstance(x, dict)), ref))
-    for a in d.get("associations") or []:
+    assoc = d.get("associations")
+    for a in assoc if isinstance(assoc, list) else []:
+        if not isinstance(a, dict):              # a stick's reply is not trusted
+            continue
         ga = norm_ga(a.get("ga"))
         num = a.get("com_obj")
         if ga is None or not isinstance(num, int):
@@ -3013,9 +3016,12 @@ def read_device(store, inst, ia, stick_id, by):
         if v and set(v.upper()) != {"F"}:        # all FF = never written
             dev[key] = v
     t = mgmt("knx-tables-read", {"device": ia})
-    tables_ok = bool(t.get("ok"))
+    assoc = t.get("associations")
+    # associations that are not a list are not a reading of the tables: the
+    # device's links stay as they are, rather than all ending
+    tables_ok = bool(t.get("ok")) and (not assoc or isinstance(assoc, list))
     if tables_ok:
-        dev["associations"] = t.get("associations") or []
+        dev["associations"] = assoc or []
     ref = "read-device:%s via %s" % (ia, stick_id)
     claims = inventory_device_claims(ia, dev, ref)
     read_attrs = {a for kind, _key_, a, _v, _r in claims if kind == "device"}
