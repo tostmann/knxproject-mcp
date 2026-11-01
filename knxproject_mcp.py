@@ -64,7 +64,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
