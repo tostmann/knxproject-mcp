@@ -1439,6 +1439,7 @@ class FakeStick:
         self.answers = True
         self.tables_ok = True
         self.stale = 0              # property reads that get the previous answer again
+        self.password = None        # an admin password: without it, 401 on every request
         self.last_prop = None
         self.assoc = [{"tsap": 1, "ga": "3/1/7", "com_obj": 0},
                       {"tsap": 3, "ga": "3/1/9", "com_obj": 5}]
@@ -1451,6 +1452,11 @@ class FakeStick:
 
             def do_POST(self):
                 msg = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if fake.password and self.headers.get("Authorization") != "Bearer " + fake.password:
+                    self.send_response(401)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 name = msg["params"]["name"]
                 args = msg["params"]["arguments"]
                 fake.calls.append(name)
@@ -1504,6 +1510,7 @@ class TestReadDevice(Base):
     def tearDown(self):
         k.MGMT_GAP_S, k.PROP_RETRY_S = self.gaps
         os.environ.pop("KNXPROJECT_STICK_URL", None)
+        os.environ.pop("KNXPROJECT_STICK_TOKEN", None)
         self.stick.close()
         super().tearDown()
 
@@ -1542,6 +1549,23 @@ class TestReadDevice(Base):
         tools = [j["tool"] for j in self.ok("proj-history")["journal"]]
         self.assertIn("proj-read-device", tools)
         self.assertIn("import:read-device", tools)
+
+    def test_a_stick_with_an_admin_password(self):
+        self.ok("proj-set", {"ref": "installation", "attr": "stick_id",
+                             "value": "0123456789ab", "said": "that stick"})
+        self.stick.password = "correct horse"
+        out = self.read()
+        self.assertEqual(out["state"], "failed")
+        self.assertIn("KNXPROJECT_STICK_TOKEN", out["message"])
+        self.assertIn("needs it", out["message"])
+        self.assertEqual(self.stick.calls, [])
+        os.environ["KNXPROJECT_STICK_TOKEN"] = "wrong one"
+        out = self.read()
+        self.assertEqual(out["state"], "failed")
+        self.assertIn("refused", out["message"])
+        self.assertNotIn("wrong one", out["message"])
+        os.environ["KNXPROJECT_STICK_TOKEN"] = "correct horse"
+        self.assertEqual(self.read()["state"], "done")
 
     def test_read_refuses_what_does_not_fit(self):
         self.ok("proj-set", {"ref": "installation", "attr": "stick_id",

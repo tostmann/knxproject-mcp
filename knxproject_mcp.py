@@ -32,7 +32,8 @@ Every option has an environment fallback: KNXPROJECT_DATA, KNXPROJECT_BIND,
 KNXPROJECT_PORT, KNXPROJECT_ALLOWED_HOSTS, KNXPROJECT_ALLOW_ANY_BIND,
 KNXPROJECT_MDNS, KNXPROJECT_MDNS_NAME, KNXPROJECT_MDNS_HOSTNAME,
 KNXPROJECT_MDNS_ADDRESS, KNXPROJECT_PRODUCT_PACK.  The server announces itself via mDNS/DNS-SD as
-_knxproject-mcp._tcp (TXT path=/mcp).
+_knxproject-mcp._tcp (TXT path=/mcp).  KNXPROJECT_STICK_TOKEN holds the admin password
+of the installation's stick, for proj-read-device and stick-check.
 """
 
 import argparse
@@ -59,12 +60,13 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.request
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -2928,12 +2930,22 @@ def stick_call(url, tool, args, timeout=STICK_TIMEOUT):
     """One tools/call on the stick -> the verb's reply (a dict carrying ok)."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": tool, "arguments": args}}).encode("utf-8")
-    req = urllib.request.Request(url, body, {"Content-Type": "application/json",
-                                             "Accept": "application/json"})
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    token = _env("KNXPROJECT_STICK_TOKEN")
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, body, headers)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as r:
             msg = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise StickError("the stick at %s refused the password in KNXPROJECT_STICK_TOKEN" % url
+                             if token else
+                             "the stick at %s has an admin password: this service needs it "
+                             "in KNXPROJECT_STICK_TOKEN" % url)
+        raise StickError("%s at %s: %s" % (tool, url, e))
     except (OSError, ValueError) as e:
         raise StickError("%s at %s: %s" % (tool, url, e))
     if not isinstance(msg, dict) or "error" in msg:

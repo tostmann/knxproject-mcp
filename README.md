@@ -48,6 +48,9 @@ The server listens on port 8096 (`/mcp`, Streamable HTTP, JSON responses) and
 announces itself via mDNS/DNS-SD as `_knxproject-mcp._tcp`. Keep the data
 directory on a local disk (SQLite locking).
 
+`proj-read-device` and `stick-check` talk to the installation's stick. A stick
+with an admin password needs it here: `-e KNXPROJECT_STICK_TOKEN=<password>`.
+
 ## Product data
 
 A record does not need the product data's descriptions of its parameters: a
