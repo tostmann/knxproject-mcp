@@ -17,6 +17,14 @@ inferred; they never talk to a KNX bus. One tool does: `proj-read-device`
 reads a device through the installation's busware KNX stick (found by mDNS)
 and records what it holds. It only reads, and only when asked to.
 
+It is one of two services that run next to **MCP4KNX**, the firmware that lets
+an AI agent commission KNX devices without ETS through a busware TUL stick: the
+stick finds this service on the LAN and forwards its tools to the agent. The
+other service, [knxprod-mcp](https://github.com/tostmann/knxprod-mcp), supplies
+the manufacturers' product data. Firmware and web flasher:
+[install.busware.de/TUL/mcp/](https://install.busware.de/TUL/mcp/);
+documentation: [BREMA for KNX](https://github.com/tostmann/BREMA/blob/main/docs/brema-for-knx.md).
+
 ## Tools
 
 | tool | |
