@@ -34,22 +34,57 @@ and records what it holds. It only reads, and only when asked to.
 
 The skill `skill://knxproject-mcp/SKILL.md` explains the workflow to the agent.
 
-## Run
+## Quick start
+
+1. **Start the container.** With the `docker-compose.yml` from this repository
+   (it uses the published image `tostmann/knxproject-mcp`, for linux/amd64 and
+   linux/arm64):
+
+   ```sh
+   docker compose up -d
+   docker compose logs                 # "created installation 'home' ...", "listening on ..."
+   ```
+
+   At the first start the server creates the installation `home`
+   (`KNXPROJECT_INSTALLATION`, its name in `KNXPROJECT_INSTALLATION_NAME`). A
+   record that already holds an installation is never changed by these two.
+   The record lives in the Docker volume `knxproject-data`; keep it on a local
+   disk (SQLite locking).
+
+   The Compose file uses host networking (Linux). The server then listens on
+   the host's LAN address only (`KNXPROJECT_BIND=auto`), port 8096, and
+   announces itself via mDNS/DNS-SD as `_knxproject-mcp._tcp`. On Docker
+   Desktop, switch to port mapping as described in `docker-compose.yml`.
+
+2. **Connect.** A busware KNX stick on the same network finds the server by
+   itself and offers its `proj-*` tools to its own clients, through its remote
+   access as well. Any other MCP client connects to `http://<host>:8096/mcp`
+   (Streamable HTTP, JSON responses), for example Claude Code:
+
+   ```sh
+   claude mcp add --transport http knxproject http://<host>:8096/mcp
+   ```
+
+3. **Name the stick.** `proj-read-device` and `stick-check` reach the
+   installation's stick by its name `busware-knx-<stick_id>.local`. The agent
+   records the id (the stick's `describe` shows it) with `proj-set`
+   `ref=installation attr=stick_id`. A stick with an admin password needs it in
+   `KNXPROJECT_STICK_TOKEN`. Without host networking, give the stick's URL in
+   `KNXPROJECT_STICK_URL`.
+
+Without Compose:
 
 ```sh
-docker build -t knxproject-mcp .
-docker run -d --name knxproject-mcp --network host \
-  -e KNXPROJECT_BIND=auto -v knxproject-data:/data -v "$PWD/import:/import:ro" \
-  knxproject-mcp
-docker exec knxproject-mcp python /app/knxproject_mcp.py init --installation home --name "My house"
+docker run -d --name knxproject-mcp --network host --restart unless-stopped \
+  -e KNXPROJECT_BIND=auto -e KNXPROJECT_INSTALLATION=home \
+  -v knxproject-data:/data -v "$PWD/import:/import:ro" \
+  tostmann/knxproject-mcp
 ```
 
-The server listens on port 8096 (`/mcp`, Streamable HTTP, JSON responses) and
-announces itself via mDNS/DNS-SD as `_knxproject-mcp._tcp`. Keep the data
-directory on a local disk (SQLite locking).
-
-`proj-read-device` and `stick-check` talk to the installation's stick. A stick
-with an admin password needs it here: `-e KNXPROJECT_STICK_TOKEN=<password>`.
+The commands below run inside the container, e.g.
+`docker compose exec knxproject-mcp python /app/knxproject_mcp.py init
+--installation flat --name "Flat"` for a second installation. With more than
+one, the tools need the argument `installation`.
 
 ## Product data
 
@@ -83,6 +118,8 @@ Bulk data is imported with commands, never through the agent:
 
 ```sh
 knxproject_mcp.py import FORMAT PATH... --installation ID [--as-of DATE]
+# in the container, with the file in ./import:
+docker compose exec knxproject-mcp python /app/knxproject_mcp.py import esf /import/house.esf --installation home
 ```
 
 | format | source | input |
@@ -114,7 +151,7 @@ knxproject_mcp.py backup DEST [--keep-days 14]
 writes a consistent, gzipped copy of the database into `DEST` (read back and
 checked) and removes copies older than `--keep-days`. Run it daily, e.g. from a
 systemd timer with `docker run --rm -v knxproject-data:/data -v /backups:/backup
-knxproject-mcp backup /backup`.
+tostmann/knxproject-mcp backup /backup`.
 
 `knxproject_mcp.py stick-check [--installation ID]` finds the installation's
 stick and checks that it answers, without bus traffic.

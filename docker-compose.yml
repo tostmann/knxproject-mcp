@@ -1,0 +1,44 @@
+# knxproject-mcp: the record of one KNX installation, kept in the Docker volume
+# knxproject-data.
+services:
+  knxproject-mcp:
+    # The published image (linux/amd64 and linux/arm64). To build from this
+    # checkout instead, replace the next line with "build: .".
+    image: tostmann/knxproject-mcp:latest
+    # Host networking (Linux) lets the server announce itself on the LAN via
+    # mDNS/DNS-SD (_knxproject-mcp._tcp), so a busware KNX stick finds it
+    # without a URL, and lets proj-read-device find the stick by its .local name.
+    network_mode: host
+    # Without host networking (Docker Desktop, or if you prefer port mapping):
+    # remove network_mode and KNXPROJECT_BIND and publish the port instead.
+    # Discovery is then skipped: enter http://<host>:8096/mcp on the stick's
+    # page, and give the stick's URL in KNXPROJECT_STICK_URL.
+    # ports:
+    #   - "8096:8096"
+    volumes:
+      - knxproject-data:/data
+      # Files to import (ESF export, Home Assistant configuration, ...), read only.
+      - ./import:/import:ro
+    environment:
+      # Listen on this host's LAN address only ("auto"), or give one address,
+      # e.g. "192.168.1.10".
+      KNXPROJECT_BIND: auto
+      # Extra host names clients use to reach this server (comma separated).
+      # IP addresses, localhost and *.local names always work.
+      KNXPROJECT_ALLOWED_HOSTS: ""
+      # The installation this record keeps, created at the first start. A
+      # record that already holds an installation is never changed by these.
+      KNXPROJECT_INSTALLATION: home
+      KNXPROJECT_INSTALLATION_NAME: "My KNX installation"
+      # The admin password of the installation's stick, if it has one
+      # (proj-read-device and stick-check need it).
+      KNXPROJECT_STICK_TOKEN: ""
+      # The stick's URL, only where its .local name cannot be resolved
+      # (no host networking), e.g. "http://192.168.1.20/mcp".
+      KNXPROJECT_STICK_URL: ""
+      # "0" switches the mDNS/DNS-SD announcement off.
+      KNXPROJECT_MDNS: "1"
+    restart: unless-stopped
+
+volumes:
+  knxproject-data:
