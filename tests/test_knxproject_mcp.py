@@ -1162,6 +1162,62 @@ def make_pack(path, app_id="FFF0123410", chunk=2):
     return path
 
 
+class TestFirstInstallation(unittest.TestCase):
+    """A container started with KNXPROJECT_INSTALLATION is usable without init."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="knxproject-test-")
+        self.store = k.Store(os.path.join(self.tmp, "data"))
+        self._env = {n: os.environ.pop(n, None)
+                     for n in ("KNXPROJECT_INSTALLATION", "KNXPROJECT_INSTALLATION_NAME")}
+
+    def tearDown(self):
+        for n, v in self._env.items():
+            if v is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def cfg(self, *argv):
+        return k.resolve_serve_config(k.build_parser().parse_args(["serve"] + list(argv)))
+
+    def test_created_in_an_empty_record_only(self):
+        self.assertTrue(k.ensure_first_installation(self.store, "home", "My house"))
+        self.assertFalse(k.ensure_first_installation(self.store, "home", "My house"))
+        self.assertFalse(k.ensure_first_installation(self.store, "other", "Other"))
+        with self.store.reader() as con:
+            rows = con.execute("SELECT id, name FROM installations").fetchall()
+        self.assertEqual([tuple(r) for r in rows], [("home", "My house")])
+        with self.store.reader() as con:
+            self.assertEqual(k._inst(con, {}), "home")
+
+    def test_an_existing_record_is_left_alone(self):
+        k.create_installation(self.store, "demo", "Demo house")
+        self.assertFalse(k.ensure_first_installation(self.store, "home", "My house"))
+        with self.store.reader() as con:
+            self.assertEqual(k._inst(con, {}), "demo")
+
+    def test_config(self):
+        self.assertIsNone(self.cfg()["first_installation"])
+        self.assertEqual(self.cfg("--installation", "home")["first_installation"],
+                         ("home", "home"))
+        os.environ["KNXPROJECT_INSTALLATION"] = "house-1"
+        os.environ["KNXPROJECT_INSTALLATION_NAME"] = "Our house"
+        self.assertEqual(self.cfg()["first_installation"], ("house-1", "Our house"))
+        self.assertEqual(self.cfg("--installation", "flat")["first_installation"],
+                         ("flat", "Our house"))
+        os.environ["KNXPROJECT_INSTALLATION"] = "My House"
+        with self.assertRaises(k.ConfigError):
+            self.cfg()
+
+    def test_empty_record_says_how_to_start(self):
+        with self.store.reader() as con:
+            with self.assertRaises(k.ToolError) as cm:
+                k._inst(con, {})
+        self.assertIn("KNXPROJECT_INSTALLATION", str(cm.exception.args))
+
+
 class TestProductPack(Base):
     """A lean record (parameter value and memory location only) reads its
     parameter names and value texts from a product pack."""

@@ -31,7 +31,8 @@ The writing tools change this record only.  They never talk to a KNX bus.
 Every option has an environment fallback: KNXPROJECT_DATA, KNXPROJECT_BIND,
 KNXPROJECT_PORT, KNXPROJECT_ALLOWED_HOSTS, KNXPROJECT_ALLOW_ANY_BIND,
 KNXPROJECT_MDNS, KNXPROJECT_MDNS_NAME, KNXPROJECT_MDNS_HOSTNAME,
-KNXPROJECT_MDNS_ADDRESS, KNXPROJECT_PRODUCT_PACK.  The server announces itself via mDNS/DNS-SD as
+KNXPROJECT_MDNS_ADDRESS, KNXPROJECT_PRODUCT_PACK, KNXPROJECT_INSTALLATION,
+KNXPROJECT_INSTALLATION_NAME.  The server announces itself via mDNS/DNS-SD as
 _knxproject-mcp._tcp (TXT path=/mcp).  KNXPROJECT_STICK_TOKEN holds the admin password
 of the installation's stick, for proj-read-device and stick-check.
 """
@@ -66,7 +67,7 @@ import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-VERSION = "0.6.2"
+VERSION = "0.7.0"
 SCHEMA_VERSION = 1
 BRIEF_OPEN_MAX = 20  # open findings and todos the brief lists
 BRIEF_ITEM_CHARS = 200  # an open item's text in the brief when it would not fit otherwise
@@ -517,8 +518,11 @@ def check_product_pack(path):
                          % ((path,) + PACK_FORMAT))
 
 
+INST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+
+
 def create_installation(store, inst_id, name, precedence=None):
-    if not re.match(r"^[a-z0-9][a-z0-9_-]{0,39}$", inst_id or ""):
+    if not INST_ID_RE.match(inst_id or ""):
         raise StoreError("installation id: lower-case letters, digits, - and _, "
                          "at most 40: %r" % inst_id)
     settings = {"precedence": list(precedence or DEFAULT_PRECEDENCE)}
@@ -527,6 +531,18 @@ def create_installation(store, inst_id, name, precedence=None):
             raise StoreError("installation %r exists" % inst_id)
         con.execute("INSERT INTO installations(id, name, created, settings) VALUES(?,?,?,?)",
                     (inst_id, _clean(name, 120) or inst_id, _now_ts(), _dumps(settings)))
+
+
+def ensure_first_installation(store, inst_id, name):
+    """Create inst_id if the store holds no installation at all, so that a
+    container started with KNXPROJECT_INSTALLATION is usable without an init
+    command.  A store that holds any installation is left as it is.
+    -> True if it was created."""
+    with store.reader() as con:
+        if con.execute("SELECT 1 FROM installations LIMIT 1").fetchone():
+            return False
+    create_installation(store, inst_id, name)
+    return True
 
 
 def installation_row(con, inst_id):
@@ -1581,7 +1597,8 @@ def _inst(con, args):
         return rows[0][0]
     if not rows:
         raise ToolError("no_installation", "this server holds no installation yet; the "
-                                           "operator creates one with the init command")
+                                           "operator creates one with the init command, or "
+                                           "starts the server with KNXPROJECT_INSTALLATION")
     raise ToolError("choose_installation", "several installations; pass installation",
                     installations=[r[0] for r in rows])
 
@@ -4385,6 +4402,10 @@ class Service:
 
 def serve(cfg):
     svc = Service(cfg)
+    first = cfg.get("first_installation")
+    if first and ensure_first_installation(svc.httpd.store, first[0], first[1]):
+        svc.log("%s created installation %r (%s): the record held none yet"
+                % (_utc_now(), first[0], first[1]))
     svc.activate()
     info_path = os.path.join(svc.data, "server.json")
     atomic_write_json(info_path, {"host": svc.httpd.server_address[0], "port": svc.port,
@@ -4508,6 +4529,11 @@ def build_parser():
     ps.add_argument("--product-pack",
                     help="product data for parameter names and value texts: a pack written by "
                          "knxprod-mcp (KNXPROJECT_PRODUCT_PACK)")
+    ps.add_argument("--installation",
+                    help="create this installation at the start if the record holds none yet "
+                         "(KNXPROJECT_INSTALLATION); one that exists is never touched")
+    ps.add_argument("--installation-name",
+                    help="its name (KNXPROJECT_INSTALLATION_NAME, default the id)")
     return ap
 
 
@@ -4547,6 +4573,12 @@ def resolve_serve_config(args):
         except ValueError:
             raise ConfigError("mDNS address must be an IPv4 address: %r" % a)
     cfg["product_pack"] = args.product_pack or _env("KNXPROJECT_PRODUCT_PACK") or None
+    first = args.installation or _env("KNXPROJECT_INSTALLATION")
+    if first is not None and not INST_ID_RE.match(first):
+        raise ConfigError("installation id: lower-case letters, digits, - and _, at most 40: %r"
+                          % first)
+    first_name = args.installation_name or _env("KNXPROJECT_INSTALLATION_NAME")
+    cfg["first_installation"] = (first, first_name or first) if first else None
     cfg["mdns"] = {"enabled": not args.no_mdns and (_env("KNXPROJECT_MDNS") or "1").lower()
                    not in ("0", "false", "no", "off"),
                    "name": name.strip() if name else None, "hostname": hostname,
