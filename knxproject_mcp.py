@@ -12,7 +12,8 @@ standard library only.
     knxproject_mcp.py import FORMAT PATH... --installation ID [--as-of DATE] ...
     knxproject_mcp.py health [--data DIR]   (exit 0 if the running server is healthy)
 
-Import formats: ets3 (a gzip CSV dump of an ETS3 project database), esf (ETS
+Import formats: ets3 (a gzip CSV dump of an ETS3 project database), knxproj (a
+project archive exported by ETS 5.7 or later, without a password), esf (ETS
 group address export), inventory (the reply of a busware KNX stick's
 knx_inventory), observe (knx_observe_list), ha-yaml (the knx: block of a Home
 Assistant configuration), fhem (fhem.cfg, EIB/KNX devices) and claims (JSON
@@ -39,6 +40,7 @@ of the installation's stick, for proj-read-device and stick-check.
 
 import argparse
 import array
+import base64
 import collections
 import contextlib
 import csv
@@ -63,6 +65,8 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -864,7 +868,7 @@ class ImportFailed(Exception):
 
 
 def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None, date_from=None,
-                  floor=None):
+                  floor=None, extra=None):
     """date_from: "data" (the input states it), "given" (--as-of) or "file" (only the
     file's modification time is known; the brief then calls the date unknown)."""
     seen = norm_ts(seen) or _now_ts()
@@ -881,6 +885,8 @@ def record_import(store, inst, source, fmt, ref, seen, claims, scope, by=None, d
         st["seen"] = seen
         if date_from:
             st["date_from"] = date_from
+        if extra:
+            st.update(extra)
         con.execute("UPDATE imports SET stats=? WHERE id=?", (_dumps(st), iid))
         journal(con, inst, by or "cli", "import:" + fmt, {"ref": ref, "seen": seen}, st)
     return st
@@ -1190,6 +1196,586 @@ def import_ets3(dump, project=None):
                            ref))
     seen = max(stamps) if stamps else None
     return claims, seen, ref
+
+
+# -- ETS 5.7 / ETS6 project archive (.knxproj) ----------------------------------
+
+KNXPROJ_MIN_SCHEMA = 20          # ETS 5.7; older archives keep the links in <Connectors>
+KNXPROJ_CHECKED_SCHEMA = 23      # the newest schema an ETS export was checked against
+KNXPROJ_MAX_MEMBER = 256 << 20   # bytes of one file in the archive
+_KNXPROJ_NS_RE = re.compile(r"^\{http://knx\.org/xml/project/(\d+)\}")
+_KNXPROJ_INST_RE = re.compile(r"^(P-[0-9A-Fa-f]{4})/(\d+)\.xml$")
+_KNXPROJ_LOCKED_RE = re.compile(r"^(P-[0-9A-Fa-f]{4})\.zip$")
+_KNXPROJ_DPT_RE = re.compile(r"^DPS?T-(\d{1,3})(?:-(\d{1,3}))?$", re.A)
+_KNXPROJ_MASK_RE = re.compile(r"^MV-([0-9A-Fa-f]{4})$")
+_KNXPROJ_FLAGS = (("C", "CommunicationFlag"), ("R", "ReadFlag"), ("W", "WriteFlag"),
+                  ("T", "TransmitFlag"), ("U", "UpdateFlag"), ("I", "ReadOnInitFlag"))
+
+
+def _x(el):
+    return el.tag.rsplit("}", 1)[-1]
+
+
+def _xkids(el, name):
+    return [c for c in el if _x(c) == name]
+
+
+def _xkid(el, name):
+    for c in el:
+        if _x(c) == name:
+            return c
+    return None
+
+
+def _xall(el, name):
+    return [c for c in el.iter() if _x(c) == name]
+
+
+def _knxproj_xml(z, name):
+    """The parsed file `name` of the archive, or None if it has none."""
+    try:
+        info = z.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > KNXPROJ_MAX_MEMBER:
+        raise ImportFailed("%s in the archive is larger than %d MB"
+                           % (name, KNXPROJ_MAX_MEMBER >> 20))
+    try:
+        with z.open(info) as f:
+            return ET.parse(f).getroot()
+    except ET.ParseError as e:
+        raise ImportFailed("%s in the archive is not XML: %s" % (name, e))
+    except (RuntimeError, NotImplementedError, zipfile.BadZipFile, OSError) as e:
+        raise ImportFailed("%s cannot be read from the archive: %s" % (name, e))
+
+
+def _knxproj_dpt(s):
+    """'DPST-5-1' -> '5.001', 'DPT-9' -> '9'; of several, the first."""
+    for tok in str(s or "").split():
+        m = _KNXPROJ_DPT_RE.match(tok)
+        if m:
+            main, sub = int(m.group(1)), m.group(2)
+            return "%d.%03d" % (main, int(sub)) if sub is not None else str(main)
+    return None
+
+
+def _knxproj_on(s):
+    return str(s or "").strip().lower() in ("enabled", "true", "1")
+
+
+_RTF_TOKEN_RE = re.compile(r"\\([a-zA-Z]{1,32})(-?\d{1,10})? ?|\\'([0-9a-fA-F]{2})|\\(.)|([{}])"
+                           r"|([^\\{}]+)", re.S)
+_RTF_SKIP = frozenset(("fonttbl", "colortbl", "stylesheet", "info", "pict", "header", "footer",
+                       "listtable", "listoverridetable", "rsidtbl", "generator", "themedata",
+                       "colorschememapping", "latentstyles", "datastore", "xmlnstbl", "fldinst"))
+
+
+def rtf_text(rtf):
+    """The plain text of an RTF document: what ETS6 writes for a comment."""
+    out, stack = [], []
+    skip, uc, owed = False, 1, 0      # owed: fallback characters after a \u
+    for m in _RTF_TOKEN_RE.finditer(rtf):
+        word, arg, hexb, sym, brace, text = m.groups()
+        if brace == "{":
+            stack.append((skip, uc))
+        elif brace == "}":
+            skip, uc = stack.pop() if stack else (False, 1)
+            owed = 0
+        elif word:
+            if word in _RTF_SKIP:
+                skip = True
+            elif word == "uc":
+                uc = _int(arg, 1)
+            elif word == "u" and arg is not None:
+                if not skip:
+                    out.append(chr(int(arg) & 0xFFFF))
+                owed = uc
+            elif not skip and word in ("par", "line"):
+                out.append("\n")
+            elif not skip and word == "tab":
+                out.append("\t")
+        elif hexb:
+            if owed:
+                owed -= 1
+            elif not skip:
+                out.append(bytes([int(hexb, 16)]).decode("cp1252", "replace"))
+        elif sym:
+            if sym == "*":
+                skip = True
+            elif owed:
+                owed -= 1
+            elif not skip and sym in "\\{}":
+                out.append(sym)
+            elif not skip and sym == "~":
+                out.append(" ")
+        elif text:
+            text = text.replace("\r", "").replace("\n", "")
+            if owed:
+                cut = min(owed, len(text))
+                text, owed = text[cut:], owed - cut
+            if not skip:
+                out.append(text)
+    return "".join(out)
+
+
+def _knxproj_text(s, report=None):
+    """A text attribute; ETS6 writes comments and hints as RTF."""
+    t = str(s or "")
+    if t.lstrip().startswith("{\\rtf"):
+        t = rtf_text(t)
+    return _clean(t) or None
+
+
+def _knxproj_value(raw):
+    v = _int(raw)
+    return v if v is not None and str(raw).strip() == str(v) else _clean(raw)
+
+
+def _knxproj_serial(b64):
+    """ETS writes a device's serial number base64-encoded: 'APqAK3wA' -> '00FA802B7C00'."""
+    try:
+        raw = base64.b64decode(str(b64 or ""), validate=True)
+    except (ValueError, TypeError):
+        return None
+    return raw.hex().upper() if len(raw) == 6 else None
+
+
+class _KnxprojApp:
+    """One application program as the archive carries it: what its objects and
+    parameters are called and where a parameter lives."""
+
+    def __init__(self, root, app_id):
+        self.id = app_id
+        self.prefix = app_id + "_"
+        prog = next((e for e in _xall(root, "ApplicationProgram") if e.get("Id") == app_id),
+                    None) if root is not None else None
+        if prog is None:
+            raise ImportFailed("the archive has no application program %s" % app_id)
+        self.name = _clean(prog.get("Name"))
+        self.number = _int(prog.get("ApplicationNumber"))
+        self.version = _int(prog.get("ApplicationVersion"))
+        m = _KNXPROJ_MASK_RE.match(str(prog.get("MaskVersion") or ""))
+        self.mask = int(m.group(1), 16) if m else None
+        self.languages = sorted({e.get("Identifier") for e in _xall(prog, "Language")
+                                 if e.get("Identifier")})
+        static = _xkid(prog, "Static")
+        if static is None:
+            static = prog
+        self.segments = {}
+        for seg in _xall(static, "AbsoluteSegment"):
+            self.segments[seg.get("Id")] = _int(seg.get("Address"))
+        for seg in _xall(static, "RelativeSegment"):
+            self.segments[seg.get("Id")] = None
+        self.enums, self.bits = {}, {}
+        for pt in _xall(static, "ParameterType"):
+            tid = pt.get("Id")
+            for c in pt:
+                if _x(c).startswith("Type"):
+                    self.bits[tid] = _int(c.get("SizeInBit"))
+                    if _x(c) == "TypeRestriction":
+                        self.enums[tid] = {_clean(en.get("Value")): _clean(en.get("Text"))
+                                           for en in _xkids(c, "Enumeration")}
+                    break
+        self.params = {}
+        params = _xkid(static, "Parameters")
+        for el in (params if params is not None else []):
+            if _x(el) == "Parameter":
+                self._param(el, None)
+            elif _x(el) == "Union":
+                loc = _xkid(el, "Memory")
+                if loc is None:
+                    loc = _xkid(el, "Property")
+                for p in _xkids(el, "Parameter"):
+                    self._param(p, loc)
+        self.prefs = {}
+        for r in _xall(static, "ParameterRef"):
+            self.prefs[r.get("Id")] = {"param": r.get("RefId"), "text": _clean(r.get("Text")),
+                                       "default": r.get("Value")}
+        self.objs = {o.get("Id"): o.attrib for o in _xall(static, "ComObject")}
+        self.orefs = {}
+        for r in _xall(static, "ComObjectRef"):
+            base = self.objs.get(r.get("RefId"))
+            if base is None:
+                continue
+            merged = dict(base)
+            merged.update({k: v for k, v in r.attrib.items() if k not in ("Id", "RefId")})
+            self.orefs[r.get("Id")] = merged
+        # the headings above a parameter, as the ETS shows them
+        self.paths = {}
+        dyn = _xkid(prog, "Dynamic")
+        if dyn is not None:
+            self._walk(dyn, [])
+
+    def _param(self, el, union_loc):
+        loc = None
+        own = _xkid(el, "Memory")
+        if own is None:
+            own = _xkid(el, "Property")
+        if own is not None:
+            loc = (own, _int(own.get("Offset"), 0) * 8 + _int(own.get("BitOffset"), 0))
+        elif union_loc is not None:
+            loc = (union_loc, (_int(union_loc.get("Offset"), 0) + _int(el.get("Offset"), 0)) * 8
+                   + _int(union_loc.get("BitOffset"), 0) + _int(el.get("BitOffset"), 0))
+        self.params[el.get("Id")] = {"text": _clean(el.get("Text")), "type": el.get("ParameterType"),
+                                     "default": el.get("Value"), "loc": loc}
+
+    def _walk(self, el, heads):
+        for c in el:
+            tag = _x(c)
+            if tag == "ParameterRefRef":
+                self.paths.setdefault(c.get("RefId"), " › ".join(heads[-3:]))
+            elif tag in ("Channel", "ParameterBlock"):
+                text = _clean(c.get("Text"))
+                self._walk(c, heads + [text] if text else heads)
+            else:
+                self._walk(c, heads)
+
+    def full(self, ref):
+        return ref if ref.startswith(self.prefix) else self.prefix + ref
+
+    def short(self, ref):
+        return ref[len(self.prefix):] if ref.startswith(self.prefix) else ref
+
+    def location(self, param):
+        """-> (attr, value): memory as the product pack finds it, a property, or
+        ets_only for a parameter the device never receives."""
+        p = self.params.get(param)
+        if p is None or p["loc"] is None:
+            return "ets_only", True
+        el, bits = p["loc"]
+        size = self.bits.get(p["type"])
+        if _x(el) == "Property":
+            prop = {"pid": _int(el.get("PropertyId")), "offset": bits // 8,
+                    "bit_offset": bits % 8, "size_bits": size}
+            for key, attr in (("object_index", "ObjectIndex"), ("object_type", "ObjectType")):
+                if _int(el.get(attr)) is not None:
+                    prop[key] = _int(el.get(attr))
+            return "property", prop
+        seg = el.get("CodeSegment")
+        if seg in self.segments and self.segments[seg] is not None:
+            return "memory", {"address": "0x%04X" % (self.segments[seg] + bits // 8),
+                              "bit_offset": bits % 8, "size_bits": size}
+        return "memory", {"segment": self.short(seg or ""), "offset": bits // 8,
+                          "bit_offset": bits % 8, "size_bits": size}
+
+
+def _knxproj_pick(z, path, project):
+    """-> (project id, installation file) of the archive's project."""
+    names = z.namelist()
+    locked = sorted({m.group(1) for m in map(_KNXPROJ_LOCKED_RE.match, names) if m})
+    found = collections.defaultdict(list)
+    for n in names:
+        m = _KNXPROJ_INST_RE.match(n)
+        if m:
+            found[m.group(1)].append(n)
+    if not found and locked:
+        raise ImportFailed("the project in %s is password protected: export it from ETS "
+                           "without a password (a protected project is encrypted, and this "
+                           "server does not decrypt it)" % path)
+    if not found:
+        raise ImportFailed("%s holds no ETS project (no P-xxxx/0.xml)" % path)
+    pids = sorted(found)
+    if project is not None:
+        pids = [p for p in pids if p.lower() == str(project).lower()]
+        if not pids:
+            raise ImportFailed("no project %r in %s: %s" % (project, path, ", ".join(sorted(found))))
+    if len(pids) > 1:
+        raise ImportFailed("%s holds %d projects, choose one with --project: %s"
+                           % (path, len(pids), ", ".join(pids)))
+    files = sorted(found[pids[0]])
+    if len(files) > 1:
+        raise ImportFailed("project %s has %d installations (%s); one is supported"
+                           % (pids[0], len(files), ", ".join(files)))
+    return pids[0], files[0]
+
+
+def import_knxproj(path, project=None):
+    """-> (claims, seen, ref, report).  Reads a project archive exported by
+    ETS 5.7 or later: topology, devices with their product data, locations,
+    group addresses, the objects a device shows or links, the links, and the
+    parameter values the project stores (ETS stores those set in it)."""
+    report = {}
+    try:
+        z = zipfile.ZipFile(path)
+    except (OSError, zipfile.BadZipFile) as e:
+        raise ImportFailed("%s is not a project archive: %s" % (path, e))
+    with z:
+        pid, inst_file = _knxproj_pick(z, path, project)
+        root = _knxproj_xml(z, inst_file)
+        m = _KNXPROJ_NS_RE.match(root.tag)
+        schema = int(m.group(1)) if m else None
+        report["schema"] = schema
+        if schema is None or schema < KNXPROJ_MIN_SCHEMA:
+            raise ImportFailed("%s was written by ETS 5.6 or older (schema %s): open it in "
+                               "ETS 5.7 or later and export it again" % (path, schema))
+        if schema > KNXPROJ_CHECKED_SCHEMA:
+            report["schema_unchecked"] = True
+        info = _knxproj_xml(z, "%s/project.xml" % pid)
+        pinfo = next(iter(_xall(info, "ProjectInformation")), None) if info is not None else None
+        pname = _clean(pinfo.get("Name")) if pinfo is not None else ""
+        ref = "knxproj:%s" % (pname or pid)
+        claims = [("installation", "-", "name", pname, ref)] if pname else []
+        seen = norm_ts(pinfo.get("LastModified")) if pinfo is not None else None
+
+        master = _knxproj_xml(z, "knx_master.xml")
+        media, mfrs = {}, {}
+        if master is not None:
+            media = {e.get("Id"): _clean(e.get("Name")) for e in _xall(master, "MediumType")}
+            mfrs = {e.get("Id"): _clean(e.get("Name")) for e in _xall(master, "Manufacturer")}
+        products, h2p, hw_done, apps = {}, {}, set(), {}
+
+        def hardware(mfr):
+            if mfr in hw_done:
+                return
+            hw_done.add(mfr)
+            hw = _knxproj_xml(z, "%s/Hardware.xml" % mfr)
+            if hw is None:
+                return
+            for p in _xall(hw, "Product"):
+                products[p.get("Id")] = (_clean(p.get("Text")), _clean(p.get("OrderNumber")))
+            for hp in _xall(hw, "Hardware2Program"):
+                r = _xkid(hp, "ApplicationProgramRef")
+                if r is not None:
+                    h2p[hp.get("Id")] = r.get("RefId")
+
+        def application(app_id):
+            if app_id not in apps:
+                mfr = app_id.split("_", 1)[0]
+                apps[app_id] = _KnxprojApp(_knxproj_xml(z, "%s/%s.xml" % (mfr, app_id)), app_id)
+            return apps[app_id]
+
+        def count(what, n=1):
+            report[what] = report.get(what, 0) + n
+
+        # locations: the spaces above each device
+        where = {}
+
+        def spaces(el, names):
+            for sp in _xkids(el, "Space"):
+                here = names + ([_clean(sp.get("Name"))] if _clean(sp.get("Name")) else [])
+                for r in _xkids(sp, "DeviceInstanceRef"):
+                    where.setdefault(r.get("RefId"), " › ".join(here))
+                spaces(sp, here)
+        for locs in _xall(root, "Locations"):
+            spaces(locs, [])
+
+        # group addresses
+        ga_by_id = {}
+        for gr in _xall(root, "GroupRange"):
+            start, end = _int(gr.get("RangeStart")), _int(gr.get("RangeEnd"))
+            name = _knxproj_text(gr.get("Name"))
+            if start is None or end is None or not name:
+                continue
+            if start == 1:
+                start = 0            # ETS starts the ranges holding 0/0/0 after it
+            if end - start == 2047 and start % 2048 == 0:
+                claims.append(("range", str(start >> 11), "name", name, ref))
+            elif end - start == 255 and start % 256 == 0:
+                claims.append(("range", "%d/%d" % (start >> 11, (start >> 8) & 7), "name", name,
+                               ref))
+            else:
+                count("ranges_not_main_or_middle")
+        for g in _xall(root, "GroupAddress"):
+            ga = norm_ga(_int(g.get("Address"), -1))
+            if ga is None:
+                count("group_addresses_unreadable")
+                continue
+            gid = g.get("Id") or ""
+            ga_by_id[gid] = ga
+            ga_by_id[gid.split("_", 1)[-1]] = ga          # ETS 6 links name it without project
+            claims.append(("group", ga, "present", True, ref))
+            for attr, col in (("name", "Name"), ("description", "Description"),
+                              ("comment", "Comment")):
+                t = _knxproj_text(g.get(col), report)
+                if t:
+                    claims.append(("group", ga, attr, t, ref))
+            dpt = _knxproj_dpt(g.get("DatapointType"))
+            if dpt:
+                claims.append(("group", ga, "dpt", dpt, ref))
+            for attr, col in (("central", "Central"), ("passthrough", "Unfiltered")):
+                if _knxproj_on(g.get(col)):
+                    claims.append(("group", ga, attr, True, ref))
+
+        # topology and devices
+        group_sizes = collections.defaultdict(collections.Counter)
+        stamps = []
+        for topo in _xall(root, "Topology"):
+            for area in _xkids(topo, "Area"):
+                a = _int(area.get("Address"))
+                if a is None:
+                    continue
+                for attr, col in (("name", "Name"), ("description", "Description")):
+                    t = _knxproj_text(area.get(col), report)
+                    if t:
+                        claims.append(("area", str(a), attr, t, ref))
+                for line in _xkids(area, "Line"):
+                    lnum = _int(line.get("Address"))
+                    if lnum is None:
+                        continue
+                    lk = "%d.%d" % (a, lnum)
+                    for attr, col in (("name", "Name"), ("description", "Description")):
+                        t = _knxproj_text(line.get(col), report)
+                        if t:
+                            claims.append(("line", lk, attr, t, ref))
+                    mt = line.get("MediumTypeRefId") or next(
+                        (s.get("MediumTypeRefId") for s in _xkids(line, "Segment")
+                         if s.get("MediumTypeRefId")), None)
+                    if media.get(mt):
+                        claims.append(("line", lk, "medium", media[mt], ref))
+                    for di in _xall(line, "DeviceInstance"):
+                        _knxproj_device(di, lk, ref, claims, report, count, where, products, h2p,
+                                        hardware, application, mfrs, ga_by_id, group_sizes, stamps)
+        for ga, cnt in group_sizes.items():
+            claims.append(("group", ga, "size", cnt.most_common(1)[0][0], ref))
+        langs = sorted({lang for app in apps.values() for lang in app.languages})
+        if langs:
+            report["product_translations_not_used"] = langs
+    if seen is None and stamps:
+        seen = max(stamps)
+    return claims, seen, ref, report
+
+
+def _knxproj_device(di, lk, ref, claims, report, count, where, products, h2p, hardware,
+                    application, mfrs, ga_by_id, group_sizes, stamps):
+    if _int(di.get("Address")) is None:
+        count("devices_without_address")
+        return
+    ia = norm_ia("%s.%d" % (lk, _int(di.get("Address"))))
+    if ia is None:
+        count("devices_without_address")
+        return
+    claims.append(("device", ia, "present", True, ref))
+    for attr, col in (("name", "Name"), ("description", "Description"), ("comment", "Comment")):
+        t = _knxproj_text(di.get(col), report)
+        if t:
+            claims.append(("device", ia, attr, t, ref))
+    if where.get(di.get("Id")):
+        claims.append(("device", ia, "location", where[di.get("Id")], ref))
+    serial = _knxproj_serial(di.get("SerialNumber"))
+    if serial:
+        claims.append(("device", ia, "serial", serial, ref))
+    for attr, col in (("last_modified", "LastModified"), ("last_download", "LastDownload")):
+        ts = norm_ts(di.get(col))
+        if ts:
+            claims.append(("device", ia, attr, ts, ref))
+            stamps.append(ts)
+    prod_id, hp_id = di.get("ProductRefId") or "", di.get("Hardware2ProgramRefId") or ""
+    mfr = (prod_id or hp_id).split("_", 1)[0]
+    if not mfr:
+        count("devices_without_product")
+        return
+    hardware(mfr)
+    text, order = products.get(prod_id, ("", ""))
+    if text:
+        claims.append(("device", ia, "product", text, ref))
+    if order:
+        claims.append(("device", ia, "order_number", order, ref))
+    if mfrs.get(mfr):
+        claims.append(("device", ia, "manufacturer", mfrs[mfr], ref))
+    app_id = h2p.get(hp_id)
+    if not app_id:
+        count("devices_without_application")
+        return
+    app = application(app_id)
+    if app.name:
+        claims.append(("device", ia, "app_name", app.name, ref))
+    if app.mask is not None:
+        claims.append(("device", ia, "mask", "0x%04X" % app.mask, ref))
+    mm = re.match(r"^M-([0-9A-Fa-f]{4})_", app_id)
+    aid = ets3_app_id(int(mm.group(1), 16) if mm else None, app.number, app.version, app.mask)
+    if aid:
+        claims.append(("device", ia, "app_id", aid, ref))
+
+    # objects: those the device shows (its object tree) and those linked
+    tree_el = _xkid(di, "GroupObjectTree")
+    tree = (tree_el.get("GroupObjectInstances") or "").split() if tree_el is not None else None
+    if tree is None and app.orefs:
+        count("devices_without_object_tree")
+    inst = {}
+    cir = _xkid(di, "ComObjectInstanceRefs")
+    for c in (_xkids(cir, "ComObjectInstanceRef") if cir is not None else []):
+        if _xkid(c, "Connectors") is not None:
+            raise ImportFailed("links in <Connectors> (ETS 5.6 and older) in a schema %s file"
+                               % report.get("schema"))
+        inst[c.get("RefId")] = c
+    shown = set(tree or [])
+    for r in list(tree or []) + [r for r in inst if r not in shown]:
+        c = inst.get(r)
+        links = (c.get("Links") or "").split() if c is not None else []
+        if r not in shown and not links:
+            continue
+        if r.startswith("MD-") or "_MD-" in r:
+            count("module_objects_not_read")
+            continue
+        o = app.orefs.get(app.full(r))
+        num = _int(o.get("Number")) if o else None
+        if num is None:
+            count("objects_not_in_application")
+            continue
+        own = dict(o)
+        if c is not None:
+            own.update({k: v for k, v in c.attrib.items() if k not in ("RefId", "Links")})
+        k = obj_key(ia, num)
+        for attr, col in (("name", "Text"), ("function", "FunctionText"),
+                          ("description", "Description")):
+            t = _knxproj_text(own.get(col), report)
+            if t:
+                claims.append(("object", k, attr, t, ref))
+        size = _clean(own.get("ObjectSize"))
+        if size:
+            claims.append(("object", k, "size", size, ref))
+        claims.append(("object", k, "flags", "".join(
+            ch if _knxproj_on(own.get(col)) else "-" for ch, col in _KNXPROJ_FLAGS), ref))
+        if _clean(own.get("Priority")):
+            claims.append(("object", k, "priority", _clean(own.get("Priority")), ref))
+        dpt = _knxproj_dpt(own.get("DatapointType"))
+        if dpt:
+            claims.append(("object", k, "dpt", dpt, ref))
+        if tree is not None and r not in shown:
+            claims.append(("object", k, "visible", False, ref))
+        for i, link in enumerate(links):
+            ga = ga_by_id.get(link)
+            if ga is None:
+                count("links_to_unknown_group_addresses")
+                continue
+            lkey = link_key(ia, num, ga)
+            claims.append(("link", lkey, "present", True, ref))
+            # the first group address of an object is the one it sends on: making
+            # another one the sending address moves it to the front (ETS 6.4)
+            claims.append(("link", lkey, "send", i == 0, ref))
+            if size:
+                group_sizes[ga][size] += 1
+
+    # parameters: the values the project stores
+    pir = _xkid(di, "ParameterInstanceRefs")
+    for p in (_xkids(pir, "ParameterInstanceRef") if pir is not None else []):
+        r = p.get("RefId") or ""
+        if r.startswith("MD-") or "_MD-" in r:
+            count("module_parameters_not_read")
+            continue
+        pref = app.prefs.get(app.full(r))
+        if pref is None:
+            count("parameters_not_in_application")
+            continue
+        par = app.params.get(pref["param"], {})
+        k = "%s:%s" % (ia, app.short(pref["param"]))
+        raw = p.get("Value")
+        value = _knxproj_value(raw)
+        claims.append(("param", k, "value", value, ref))
+        name = pref["text"] or par.get("text")
+        if name:
+            claims.append(("param", k, "name", name, ref))
+        text = app.enums.get(par.get("type"), {}).get(_clean(raw))
+        if text:
+            claims.append(("param", k, "text", text, ref))
+        pth = app.paths.get(app.full(r))
+        if pth:
+            claims.append(("param", k, "path", pth, ref))
+        attr, loc = app.location(pref["param"])
+        claims.append(("param", k, attr, loc, ref))
+        dflt = pref["default"] if pref["default"] is not None else par.get("default")
+        if dflt is not None and _clean(dflt) != _clean(raw):
+            claims.append(("param", k, "default", _knxproj_value(dflt), ref))
 
 
 # -- ESF ------------------------------------------------------------------------
@@ -2313,7 +2899,8 @@ def _device_params(con, inst, prec, ia, query, offset, budget):
         if prod is not None and "name" not in res and "memory" in res:
             extra = prod.describe(res["memory"]["value"], value_of(res, "value"))
         e = {"ref": key.split(":", 1)[1]}
-        for attr in ("path", "name", "value", "text", "default", "memory", "ets_only"):
+        for attr in ("path", "name", "value", "text", "default", "memory", "property",
+                     "ets_only"):
             if attr in res:
                 e[attr] = res[attr]["value"]
             elif attr in extra:
@@ -4474,7 +5061,7 @@ def _env_list(name):
     return [x.strip() for x in v.split(",") if x.strip()] if v else []
 
 
-IMPORT_FORMATS = ("ets3", "esf", "inventory", "observe", "ha-yaml", "fhem", "claims")
+IMPORT_FORMATS = ("ets3", "knxproj", "esf", "inventory", "observe", "ha-yaml", "fhem", "claims")
 
 
 def build_parser():
@@ -4510,7 +5097,8 @@ def build_parser():
     pm.add_argument("--installation", required=True)
     pm.add_argument("--as-of", help="date the data describes (default: from the data or "
                                     "the file)")
-    pm.add_argument("--project", help="ets3: project name or id")
+    pm.add_argument("--project", help="ets3: project name or id; knxproj: project id "
+                                       "(P-xxxx), if the archive holds several")
     pm.add_argument("--source", help="claims: source of the claims")
     pm.add_argument("--by", help="who imports (journal)")
     ps.add_argument("--bind", help="listen address, or 'auto' (KNXPROJECT_BIND, default %s)"
@@ -4791,6 +5379,11 @@ def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, b
         claims, seen, ref = import_ets3(p, project)
         ts, date_from = _dated(as_of, seen, p)
         st = record_import(store, inst, "ets", "ets3", ref, ts, claims, everything, by, date_from)
+    elif fmt == "knxproj":
+        claims, seen, ref, report = import_knxproj(p, project)
+        ts, date_from = _dated(as_of, seen, p)
+        st = record_import(store, inst, "knxproj", "knxproj", ref, ts, claims, everything, by,
+                           date_from, extra={"archive": report} if report else None)
     elif fmt == "esf":
         claims, ref = import_esf(p)
         ts, date_from = _dated(as_of, None, p)
@@ -4872,6 +5465,11 @@ def main(argv=None):
                 p, st["asserted"], st["new"], st["reopened"], st["ended"], st["seen"],
                 " (file date, pass --as-of if you know better)"
                 if st.get("date_from") == "file" else ""))
+            told = {key: v for key, v in (st.get("archive") or {}).items() if key != "schema"}
+            if told:
+                print("  archive: %s" % ", ".join(
+                    "%s %s" % (key, " ".join(v) if isinstance(v, list) else v)
+                    for key, v in sorted(told.items())))
         return 0
     except (ConfigError, StoreError, ImportFailed) as e:
         print("knxproject-mcp: %s" % e, file=sys.stderr)

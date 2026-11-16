@@ -133,12 +133,26 @@ docker compose exec knxproject-mcp python /app/knxproject_mcp.py import esf /imp
 | format | source | input |
 |---|---|---|
 | `ets3` | `ets` | an ETS3 project database dumped to one gzip CSV per table (`--project NAME`) |
+| `knxproj` | `knxproj` | a project archive exported by ETS 5.7 or later, without a password |
 | `esf` | `esf` | ETS group address export |
 | `inventory` | `bus` | the reply of a busware KNX stick's `knx_inventory` |
 | `observe` | `observed` | `knx_observe_list` (traffic per group address or sender) |
 | `ha-yaml` | `ha` | the `knx:` block of a Home Assistant configuration |
 | `fhem` | `fhem` | `fhem.cfg` files (EIB/KNX devices); dated backups give a time line |
 | `claims` | `--source` | JSON lines `{"ref": "1.2.3#4", "attr": "name", "value": "..."}` |
+
+From a `.knxproj` the import reads the topology, the devices with the product
+data the archive carries (product, order number, application, ApplicationId and
+serial number as a stick reads them), locations, group addresses with their
+datapoint types, the objects a device shows or links, the links (the first
+group address of an object is its sending one; ETS moves the address made
+sending to the front), names, descriptions and comments (a text ETS wrote as
+RTF is reduced to its text) and the parameter values the project lists. In the ETS 6.4 exports checked, a project lists only the
+parameters whose value differs from the default; one at its default gets no
+claim. Objects and parameters of module instances (`MD-…`) are not read yet;
+the import counts them, and whatever else it passed over, under `archive` in
+its stats, and the command prints that line. A password-protected export is
+refused: ETS encrypts the project, and this server does not decrypt it.
 
 An import speaks for its source as of its date. One older than what the record
 already holds from that source (a backup imported after a newer one) extends

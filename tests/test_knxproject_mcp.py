@@ -1,5 +1,6 @@
 """Tests for knxproject-mcp.  Every fixture is synthetic and built here."""
 
+import base64
 import contextlib
 import csv
 import datetime
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 import zlib
 import unittest
 
@@ -367,6 +369,296 @@ class TestEts3(Base):
         with self.store.reader() as con:
             rows = k.load_claims(con, "demo", kind="link", keys=["1.2.3#2>3/1/8"], ended=True)
         self.assertTrue(rows and all(r["ended_at"] == "2016-01-01T00:00:00" for r in rows))
+
+
+# ---------------------------------------------------------------------------
+# ETS 5.7 / ETS6 project archive -- synthetic, laid out like an ETS 6.4 export
+# ---------------------------------------------------------------------------
+
+KNXPROJ_NS = "http://knx.org/xml/project/%d"
+KNXPROJ_APP = "M-FFF0_A-1234-10-ABCD"
+
+KNXPROJ_MASTER = """<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="{ns}"><MasterData>
+  <MediumTypes><MediumType Id="MT-0" Number="0" Name="TP" Text="Twisted Pair"/>
+    <MediumType Id="MT-5" Number="5" Name="IP" Text="KNXnet/IP"/></MediumTypes>
+  <Manufacturers><Manufacturer Id="M-FFF0" KnxManufacturerId="65520" Name="Test Co"/></Manufacturers>
+</MasterData></KNX>"""
+
+KNXPROJ_HARDWARE = """<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="{ns}"><ManufacturerData><Manufacturer RefId="M-FFF0"><Hardware>
+  <Hardware Id="M-FFF0_H-1-1" Name="Switch actuator" SerialNumber="1" VersionNumber="1">
+    <Products><Product Id="M-FFF0_H-1-1_P-SW.2D8" Text="Switch actuator 8-fold" OrderNumber="SW-8"/></Products>
+    <Hardware2Programs><Hardware2Program Id="M-FFF0_H-1-1_HP-1234-10-ABCD" MediumTypes="MT-0">
+      <ApplicationProgramRef RefId="M-FFF0_A-1234-10-ABCD"/></Hardware2Program></Hardware2Programs>
+  </Hardware>
+</Hardware></Manufacturer></ManufacturerData></KNX>"""
+
+KNXPROJ_APPLICATION = """<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="{ns}"><ManufacturerData><Manufacturer RefId="M-FFF0"><ApplicationPrograms>
+<ApplicationProgram Id="{a}" ApplicationNumber="4660" ApplicationVersion="16" MaskVersion="MV-07B0" Name="Switch 8-fold">
+ <Static>
+  <Code>
+   <AbsoluteSegment Id="{a}_AS-4000" Address="16384" Size="64"/>
+   <RelativeSegment Id="{a}_RS-04-00000" Name="Parameters" Offset="0" Size="16" LoadStateMachine="4"/>
+  </Code>
+  <ParameterTypes>
+   <ParameterType Id="{a}_PT-Base" Name="Base"><TypeRestriction Base="Value" SizeInBit="8">
+     <Enumeration Text="1 s" Value="3" Id="{a}_PT-Base_EN-3"/>
+     <Enumeration Text="1 min" Value="4" Id="{a}_PT-Base_EN-4"/></TypeRestriction></ParameterType>
+   <ParameterType Id="{a}_PT-Num" Name="Num"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="255"/></ParameterType>
+   <ParameterType Id="{a}_PT-Nibble" Name="Nibble"><TypeNumber SizeInBit="4" Type="unsignedInt" minInclusive="0" maxInclusive="15"/></ParameterType>
+  </ParameterTypes>
+  <Parameters>
+   <Parameter Id="{a}_P-1" Name="Base" ParameterType="{a}_PT-Base" Text="Staircase time base" Value="4">
+     <Memory CodeSegment="{a}_RS-04-00000" Offset="0" BitOffset="0"/></Parameter>
+   <Parameter Id="{a}_P-2" Name="Factor" ParameterType="{a}_PT-Num" Text="Factor" Value="1">
+     <Memory CodeSegment="{a}_AS-4000" Offset="2" BitOffset="0"/></Parameter>
+   <Union SizeInBit="16"><Memory CodeSegment="{a}_RS-04-00000" Offset="4" BitOffset="0"/>
+     <Parameter Id="{a}_P-3" Name="Low" ParameterType="{a}_PT-Nibble" Text="Low nibble" Value="0" Offset="1" BitOffset="4"/>
+   </Union>
+   <Parameter Id="{a}_P-4" Name="Note" ParameterType="{a}_PT-Num" Text="Planning only" Value="0"/>
+   <Parameter Id="{a}_P-5" Name="Prop" ParameterType="{a}_PT-Num" Text="In a property" Value="0">
+     <Property ObjectIndex="0" PropertyId="200" Offset="0" BitOffset="0"/></Parameter>
+  </Parameters>
+  <ParameterRefs>
+   <ParameterRef Id="{a}_P-1_R-1" RefId="{a}_P-1"/>
+   <ParameterRef Id="{a}_P-2_R-2" RefId="{a}_P-2" Text="Staircase time factor" Value="5"/>
+   <ParameterRef Id="{a}_P-3_R-3" RefId="{a}_P-3"/>
+   <ParameterRef Id="{a}_P-4_R-4" RefId="{a}_P-4"/>
+   <ParameterRef Id="{a}_P-5_R-5" RefId="{a}_P-5"/>
+  </ParameterRefs>
+  <ComObjectTable>
+   <ComObject Id="{a}_O-0" Name="Sw" Text="Switch" Number="0" FunctionText="On/Off" ObjectSize="1 Bit" ReadFlag="Disabled" WriteFlag="Enabled" CommunicationFlag="Enabled" TransmitFlag="Disabled" UpdateFlag="Disabled" ReadOnInitFlag="Disabled" Priority="Low" DatapointType="DPST-1-1"/>
+   <ComObject Id="{a}_O-1" Name="St" Text="Status" Number="1" FunctionText="On/Off" ObjectSize="1 Bit" ReadFlag="Enabled" WriteFlag="Disabled" CommunicationFlag="Enabled" TransmitFlag="Enabled" UpdateFlag="Disabled" ReadOnInitFlag="Disabled" DatapointType="DPST-1-1"/>
+   <ComObject Id="{a}_O-2" Name="Lock" Text="Lock" Number="2" FunctionText="Enable" ObjectSize="1 Bit" ReadFlag="Disabled" WriteFlag="Enabled" CommunicationFlag="Enabled" TransmitFlag="Disabled" UpdateFlag="Disabled" ReadOnInitFlag="Disabled" DatapointType="DPST-1-3"/>
+  </ComObjectTable>
+  <ComObjectRefs>
+   <ComObjectRef Id="{a}_O-0_R-0" RefId="{a}_O-0" Text="Switch, channel A"/>
+   <ComObjectRef Id="{a}_O-1_R-1" RefId="{a}_O-1"/>
+   <ComObjectRef Id="{a}_O-2_R-2" RefId="{a}_O-2"/>
+  </ComObjectRefs>
+ </Static>
+ <Dynamic><Channel Id="{a}_CH-1" Name="A" Text="A">
+   <ParameterBlock Id="{a}_PB-1" Name="Sw" Text="Switching">
+     <ParameterRefRef RefId="{a}_P-1_R-1"/>
+     <choose ParamRefId="{a}_P-1_R-1"><when test="3"><ParameterRefRef RefId="{a}_P-2_R-2"/></when></choose>
+     <ComObjectRefRef RefId="{a}_O-0_R-0"/>
+   </ParameterBlock></Channel></Dynamic>
+</ApplicationProgram>
+</ApplicationPrograms></Manufacturer></ManufacturerData></KNX>"""
+
+KNXPROJ_PROJECT = """<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="{ns}"><Project Id="P-0ABC">
+  <ProjectInformation Name="Demo" GroupAddressStyle="ThreeLevel" LastModified="{modified}"/>
+</Project></KNX>"""
+
+KNXPROJ_INSTALLATION = """<?xml version="1.0" encoding="utf-8"?>
+<KNX xmlns="{ns}"><Project Id="P-0ABC"><Installations><Installation Name="">
+ <Topology>
+  <Area Id="P-0ABC-0_A-1" Address="1" Name="House">
+   <Line Id="P-0ABC-0_L-1" Address="2" Name="Ground floor line">
+    <Segment Id="P-0ABC-0_S-1" Number="0" MediumTypeRefId="MT-0">
+     <DeviceInstance Id="P-0ABC-0_DI-1" Address="3" Name="Kitchen actuator" Description="Kitchen board"
+        Comment="{{\\rtf1\\ansi Bought 2021}}" SerialNumber="{serial}"
+        ProductRefId="M-FFF0_H-1-1_P-SW.2D8" Hardware2ProgramRefId="M-FFF0_H-1-1_HP-1234-10-ABCD"
+        LastModified="2026-02-01T09:00:00.5Z" LastDownload="2026-02-01T09:05:00Z">
+      <ParameterInstanceRefs>
+       <ParameterInstanceRef RefId="{a}_P-1_R-1" Value="3"/>
+       <ParameterInstanceRef RefId="{a}_P-2_R-2" Value="7"/>
+       <ParameterInstanceRef RefId="{a}_P-3_R-3" Value="9"/>
+       <ParameterInstanceRef RefId="{a}_P-4_R-4" Value="0"/>
+       <ParameterInstanceRef RefId="{a}_P-5_R-5" Value="12"/>
+       <ParameterInstanceRef RefId="{a}_MD-1_M-1_MI-1_P-1_R-1" Value="1"/>
+      </ParameterInstanceRefs>
+      <ComObjectInstanceRefs>
+       <ComObjectInstanceRef RefId="O-0_R-0" Links="{links0}"/>
+       <ComObjectInstanceRef RefId="O-1_R-1" Text="Kitchen light on" Links="GA-3"/>
+       <ComObjectInstanceRef RefId="O-2_R-2" Links="GA-2"/>
+       <ComObjectInstanceRef RefId="MD-1_M-1_MI-1_O-3-0_R-1" Links="GA-3"/>
+       <ComObjectInstanceRef RefId="O-9_R-9" Links="GA-3"/>
+      </ComObjectInstanceRefs>
+      <GroupObjectTree GroupObjectInstances="O-0_R-0 O-1_R-1"/>
+     </DeviceInstance>
+     <DeviceInstance Id="P-0ABC-0_DI-2" Name="Not yet addressed"
+        ProductRefId="M-FFF0_H-1-1_P-SW.2D8" Hardware2ProgramRefId="M-FFF0_H-1-1_HP-1234-10-ABCD"/>
+    </Segment>
+   </Line>
+  </Area>
+ </Topology>
+ <Locations>
+  <Space Type="Building" Id="P-0ABC-0_BP-1" Name="Demo house">
+   <Space Type="Floor" Id="P-0ABC-0_BP-2" Name="Ground floor">
+    <Space Type="Room" Id="P-0ABC-0_BP-3" Name="Kitchen"><DeviceInstanceRef RefId="P-0ABC-0_DI-1"/></Space>
+   </Space>
+  </Space>
+ </Locations>
+ <GroupAddresses><GroupRanges>
+  <GroupRange Id="P-0ABC-0_GR-1" RangeStart="6144" RangeEnd="8191" Name="Lighting">
+   <GroupRange Id="P-0ABC-0_GR-2" RangeStart="6400" RangeEnd="6655" Name="Kitchen">
+    <GroupAddress Id="P-0ABC-0_GA-1" Address="6407" Name="Kitchen light" DatapointType="DPST-1-1"/>
+    <GroupAddress Id="P-0ABC-0_GA-2" Address="6408" Name="All lights" Central="true" DatapointType="DPT-1"/>
+    <GroupAddress Id="P-0ABC-0_GA-3" Address="6409" Name="Kitchen light status" Comment="{{\\rtf1 x}}"/>
+   </GroupRange>
+   <GroupRange Id="P-0ABC-0_GR-3" RangeStart="7000" RangeEnd="7099" Name="Free style"/>
+  </GroupRange>
+  <GroupRange Id="P-0ABC-0_GR-4" RangeStart="1" RangeEnd="2047" Name="Central">
+   <GroupRange Id="P-0ABC-0_GR-5" RangeStart="1" RangeEnd="255" Name="Scenes"/>
+  </GroupRange>
+ </GroupRanges></GroupAddresses>
+</Installation></Installations></Project></KNX>"""
+
+
+def make_knxproj(path, schema=23, modified="2026-03-01T10:00:00.1234567Z", links0="GA-1 GA-2",
+                 locked=False):
+    ns = KNXPROJ_NS % schema
+    serial = base64.b64encode(bytes.fromhex("FFF000000001")).decode()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("knx_master.xml", KNXPROJ_MASTER.format(ns=ns))
+        z.writestr("M-FFF0/Hardware.xml", KNXPROJ_HARDWARE.format(ns=ns))
+        z.writestr("M-FFF0/%s.xml" % KNXPROJ_APP, KNXPROJ_APPLICATION.format(ns=ns, a=KNXPROJ_APP))
+        z.writestr("P-0ABC.info", json.dumps({"ProjectName": "Demo",
+                                              "IsPasswordProtected": locked}))
+        if locked:
+            z.writestr("P-0ABC.zip", b"PK\x03\x04 encrypted")
+            return path
+        z.writestr("P-0ABC/project.xml", KNXPROJ_PROJECT.format(ns=ns, modified=modified))
+        z.writestr("P-0ABC/0.xml", KNXPROJ_INSTALLATION.format(
+            ns=ns, a=KNXPROJ_APP, serial=serial, links0=links0))
+    return path
+
+
+class TestKnxproj(Base):
+    def archive(self, name="demo.knxproj", **kw):
+        return make_knxproj(os.path.join(self.tmp, name), **kw)
+
+    def test_content(self):
+        claims, seen, ref, report = k.import_knxproj(self.archive())
+        c = {(a, b, attr): v for a, b, attr, v, _r in claims}
+        self.assertEqual((seen, ref), ("2026-03-01T10:00:00", "knxproj:Demo"))
+        self.assertEqual(c[("installation", "-", "name")], "Demo")
+        self.assertEqual(c[("area", "1", "name")], "House")
+        self.assertEqual(c[("line", "1.2", "name")], "Ground floor line")
+        self.assertEqual(c[("line", "1.2", "medium")], "TP")
+        d = lambda attr: c[("device", "1.2.3", attr)]  # noqa: E731
+        self.assertEqual(d("name"), "Kitchen actuator")
+        self.assertEqual(d("description"), "Kitchen board")
+        self.assertEqual(d("comment"), "Bought 2021")                      # RTF in the file
+        self.assertEqual(d("location"), "Demo house › Ground floor › Kitchen")
+        self.assertEqual(d("serial"), "FFF000000001")                      # as a stick reads it
+        self.assertEqual(d("app_id"), "FFF0123410")                        # as a stick reads it
+        self.assertEqual(d("mask"), "0x07B0")
+        self.assertEqual((d("product"), d("order_number"), d("manufacturer"), d("app_name")),
+                         ("Switch actuator 8-fold", "SW-8", "Test Co", "Switch 8-fold"))
+        self.assertEqual((d("last_modified"), d("last_download")),
+                         ("2026-02-01T09:00:00", "2026-02-01T09:05:00"))
+        self.assertEqual(c[("range", "3", "name")], "Lighting")
+        self.assertEqual(c[("range", "3/1", "name")], "Kitchen")
+        self.assertEqual(c[("range", "0", "name")], "Central")              # ETS starts it at 1
+        self.assertEqual(c[("range", "0/0", "name")], "Scenes")
+        self.assertEqual(c[("group", "3/1/7", "dpt")], "1.001")
+        self.assertEqual(c[("group", "3/1/8", "dpt")], "1")
+        self.assertTrue(c[("group", "3/1/8", "central")])
+        self.assertEqual(c[("group", "3/1/9", "comment")], "x")
+        self.assertEqual(c[("group", "3/1/7", "size")], "1 Bit")
+        # objects: the ref's text over the object's, the instance's over both
+        self.assertEqual(c[("object", "1.2.3#0", "name")], "Switch, channel A")
+        self.assertEqual(c[("object", "1.2.3#1", "name")], "Kitchen light on")
+        self.assertEqual(c[("object", "1.2.3#0", "flags")], "C-W---")
+        self.assertEqual(c[("object", "1.2.3#1", "flags")], "CR-T--")
+        self.assertEqual(c[("object", "1.2.3#0", "priority")], "Low")
+        self.assertEqual(c[("object", "1.2.3#0", "dpt")], "1.001")
+        self.assertFalse(c[("object", "1.2.3#2", "visible")])              # linked, not shown
+        self.assertNotIn(("object", "1.2.3#0", "visible"), c)
+        self.assertTrue(c[("link", "1.2.3#0>3/1/7", "send")])
+        self.assertFalse(c[("link", "1.2.3#0>3/1/8", "send")])
+        self.assertTrue(c[("link", "1.2.3#1>3/1/9", "present")])
+        # parameters: value, its text, where it lives
+        p = "1.2.3:P-1"
+        self.assertEqual((c[("param", p, "value")], c[("param", p, "text")]), (3, "1 s"))
+        self.assertEqual((c[("param", p, "name")], c[("param", p, "default")]),
+                         ("Staircase time base", 4))
+        self.assertEqual(c[("param", p, "path")], "A › Switching")
+        self.assertEqual(c[("param", p, "memory")],
+                         {"segment": "RS-04-00000", "offset": 0, "bit_offset": 0, "size_bits": 8})
+        p = "1.2.3:P-2"
+        self.assertEqual((c[("param", p, "name")], c[("param", p, "default")]),
+                         ("Staircase time factor", 5))                     # the ref's
+        self.assertEqual(c[("param", p, "path")], "A › Switching")         # under a choose
+        self.assertEqual(c[("param", p, "memory")],
+                         {"address": "0x4002", "bit_offset": 0, "size_bits": 8})
+        self.assertEqual(c[("param", "1.2.3:P-3", "memory")],                # in a union
+                         {"segment": "RS-04-00000", "offset": 5, "bit_offset": 4, "size_bits": 4})
+        self.assertTrue(c[("param", "1.2.3:P-4", "ets_only")])
+        self.assertNotIn(("param", "1.2.3:P-4", "default"), c)             # equals the value
+        self.assertEqual(c[("param", "1.2.3:P-5", "property")],
+                         {"pid": 200, "offset": 0, "bit_offset": 0, "size_bits": 8,
+                          "object_index": 0})
+        self.assertEqual(report, {"schema": 23, "devices_without_address": 1,
+                                  "module_objects_not_read": 1, "objects_not_in_application": 1,
+                                  "module_parameters_not_read": 1,
+                                  "ranges_not_main_or_middle": 1})
+
+    def test_rtf_text(self):
+        self.assertEqual(k.rtf_text(r"{\rtf1\ansi\uc1{\fonttbl{\f0 Segoe UI;}}{\*\generator W;}"
+                                    r"Gr\'f6\'dfe pr\u252?fen\par Zeile 2 \{x\}}"),
+                         "Größe prüfen\nZeile 2 {x}")
+        self.assertEqual(k.rtf_text("{\\rtf1{\\colortbl\\red0;}\r\n}"), "")
+
+    def test_reimport_is_idempotent_and_ends_what_disappeared(self):
+        st = self.imp("knxproj", self.archive())[0][1]
+        self.assertGreater(st["new"], 50)
+        self.assertEqual(st["archive"]["module_objects_not_read"], 1)
+        st = self.imp("knxproj", self.archive())[0][1]
+        self.assertEqual((st["new"], st["ended"]), (0, 0))
+        st = self.imp("knxproj", self.archive("b.knxproj", modified="2026-04-01T08:00:00Z",
+                                              links0="GA-1"))[0][1]
+        self.assertGreater(st["ended"], 0)
+        with self.store.reader() as con:
+            rows = k.load_claims(con, "demo", kind="link", keys=["1.2.3#0>3/1/8"], ended=True)
+        self.assertTrue(rows and all(r["ended_at"] == "2026-04-01T08:00:00" for r in rows))
+
+    def test_seen_by_the_tools(self):
+        self.imp("knxproj", self.archive())
+        dev = self.ok("proj-device", {"address": "1.2.3"})
+        self.assertEqual(dev["location"], "Demo house › Ground floor › Kitchen")
+        params = self.ok("proj-device", {"address": "1.2.3", "section": "params"})["params"]
+        by_ref = {p["ref"]: p for p in params}
+        self.assertEqual(by_ref["P-1"]["text"], "1 s")
+        self.assertEqual(by_ref["P-5"]["property"]["pid"], 200)
+        grp = self.ok("proj-group", {"ga": "3/1/7"})
+        self.assertEqual([(x["device"], x["object"], x["send"]) for x in grp["links"]],
+                         [("1.2.3", 0, True)])
+        self.assertIn("knxproj", [s["source"] for s in self.ok("proj-brief")["sources"]])
+
+    def test_refused(self):
+        with self.assertRaises(k.ImportFailed) as cm:
+            k.import_knxproj(self.archive("locked.knxproj", locked=True))
+        self.assertIn("password", str(cm.exception))
+        with self.assertRaises(k.ImportFailed) as cm:
+            k.import_knxproj(self.archive("old.knxproj", schema=14))
+        self.assertIn("ETS 5.7", str(cm.exception))
+        with self.assertRaises(k.ImportFailed):
+            k.import_knxproj(self.path("not.knxproj", "plain text"))
+        with self.assertRaises(k.ImportFailed):
+            k.import_knxproj(self.archive(), project="P-1234")
+        claims, _s, _r, report = k.import_knxproj(self.archive("new.knxproj", schema=24))
+        self.assertTrue(report["schema_unchecked"])
+        self.assertTrue(claims)
+
+    def test_cli_names_what_it_did_not_read(self):
+        data = os.path.join(self.tmp, "cli")
+        self.assertEqual(k.main(["init", "--data", data, "--installation", "x", "--name", "X"]), 0)
+        buf, old = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            rc = k.main(["import", "knxproj", self.archive(), "--installation", "x",
+                         "--data", data])
+        finally:
+            sys.stdout = old
+        self.assertEqual(rc, 0)
+        self.assertIn("as of 2026-03-01T10:00:00", buf.getvalue())
+        self.assertIn("module_objects_not_read 1", buf.getvalue())
 
 
 class TestLifecycle(Base):
