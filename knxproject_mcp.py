@@ -13,11 +13,12 @@ standard library only.
     knxproject_mcp.py health [--data DIR]   (exit 0 if the running server is healthy)
 
 Import formats: ets3 (a gzip CSV dump of an ETS3 project database), knxproj (a
-project archive exported by ETS 5.7 or later, without a password), esf (ETS
-group address export), inventory (the reply of a busware KNX stick's
-knx_inventory), observe (knx_observe_list), ha-yaml (the knx: block of a Home
-Assistant configuration), fhem (fhem.cfg, EIB/KNX devices) and claims (JSON
-lines).  Bulk data never passes through the agent: imports are commands.
+project archive exported by ETS 5.7 or later; an ETS 6 project password comes
+from KNXPROJ_PASSWORD or is typed in), esf (ETS group address export),
+inventory (the reply of a busware KNX stick's knx_inventory), observe
+(knx_observe_list), ha-yaml (the knx: block of a Home Assistant
+configuration), fhem (fhem.cfg, EIB/KNX devices) and claims (JSON lines).
+Bulk data never passes through the agent: imports are commands.
 
 Every statement is a claim: (kind, key, attribute, value, source, when).
 Several sources may say different things about the same group address; the
@@ -46,8 +47,12 @@ import contextlib
 import csv
 import datetime
 import fcntl
+import getpass
 import glob
 import gzip
+import hashlib
+import hmac
+import io
 import ipaddress
 import json
 import math
@@ -1203,6 +1208,8 @@ def import_ets3(dump, project=None):
 KNXPROJ_MIN_SCHEMA = 20          # ETS 5.7; older archives keep the links in <Connectors>
 KNXPROJ_CHECKED_SCHEMA = 23      # the newest schema an ETS export was checked against
 KNXPROJ_MAX_MEMBER = 256 << 20   # bytes of one file in the archive
+KNXPROJ_LOCKED_MIN_SCHEMA = 21   # ETS 6: how the archive password follows from the project's
+KNXPROJ_ETS6_SALT = b"21.project.ets.knx.org"
 _KNXPROJ_NS_RE = re.compile(r"^\{http://knx\.org/xml/project/(\d+)\}")
 _KNXPROJ_INST_RE = re.compile(r"^(P-[0-9A-Fa-f]{4})/(\d+)\.xml$")
 _KNXPROJ_LOCKED_RE = re.compile(r"^(P-[0-9A-Fa-f]{4})\.zip$")
@@ -1247,6 +1254,197 @@ def _knxproj_xml(z, name):
         raise ImportFailed("%s in the archive is not XML: %s" % (name, e))
     except (RuntimeError, NotImplementedError, zipfile.BadZipFile, OSError) as e:
         raise ImportFailed("%s cannot be read from the archive: %s" % (name, e))
+
+
+def _knxproj_parse(data, name):
+    try:
+        return ET.fromstring(data)
+    except ET.ParseError as e:
+        raise ImportFailed("%s in the archive is not XML: %s" % (name, e))
+
+
+def _aes_tables():
+    """S-box and the four encryption tables of AES (FIPS-197), computed."""
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = (p ^ (p << 1) ^ (0x1B if p & 0x80 else 0)) & 0xFF        # p * 3
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09                                                 # q / 3
+        x = q ^ ((q << 1 | q >> 7) & 0xFF) ^ ((q << 2 | q >> 6) & 0xFF) \
+            ^ ((q << 3 | q >> 5) & 0xFF) ^ ((q << 4 | q >> 4) & 0xFF)
+        sbox[p] = x ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    t0 = []
+    for s in sbox:
+        s2 = ((s << 1) ^ (0x1B if s & 0x80 else 0)) & 0xFF
+        t0.append(s2 << 24 | s << 16 | s << 8 | (s2 ^ s))
+    t1 = [(t >> 8 | t << 24) & 0xFFFFFFFF for t in t0]
+    t2 = [(t >> 8 | t << 24) & 0xFFFFFFFF for t in t1]
+    t3 = [(t >> 8 | t << 24) & 0xFFFFFFFF for t in t2]
+    return sbox, t0, t1, t2, t3
+
+
+_AES = None
+
+
+class _Aes:
+    """AES encryption of single blocks: all that counter mode needs."""
+
+    def __init__(self, key):
+        global _AES
+        if _AES is None:
+            _AES = _aes_tables()
+        sbox = _AES[0]
+        if len(key) not in (16, 24, 32):
+            raise ValueError("an AES key has 16, 24 or 32 bytes")
+        nk = len(key) // 4
+        self.rounds = nk + 6
+        w = [int.from_bytes(key[4 * i:4 * i + 4], "big") for i in range(nk)]
+        rcon = 1
+        for i in range(nk, 4 * (self.rounds + 1)):
+            t = w[i - 1]
+            if i % nk == 0:
+                t = (t << 8 | t >> 24) & 0xFFFFFFFF
+                t = (sbox[t >> 24] << 24 | sbox[t >> 16 & 255] << 16
+                     | sbox[t >> 8 & 255] << 8 | sbox[t & 255]) ^ (rcon << 24)
+                rcon = ((rcon << 1) ^ (0x1B if rcon & 0x80 else 0)) & 0xFF
+            elif nk > 6 and i % nk == 4:
+                t = (sbox[t >> 24] << 24 | sbox[t >> 16 & 255] << 16
+                     | sbox[t >> 8 & 255] << 8 | sbox[t & 255])
+            w.append(w[i - nk] ^ t)
+        self.w = w
+
+    def encrypt(self, block):
+        sbox, t0, t1, t2, t3 = _AES
+        w = self.w
+        s0 = int.from_bytes(block[0:4], "big") ^ w[0]
+        s1 = int.from_bytes(block[4:8], "big") ^ w[1]
+        s2 = int.from_bytes(block[8:12], "big") ^ w[2]
+        s3 = int.from_bytes(block[12:16], "big") ^ w[3]
+        k = 4
+        for _ in range(self.rounds - 1):
+            s0, s1, s2, s3 = (
+                t0[s0 >> 24] ^ t1[s1 >> 16 & 255] ^ t2[s2 >> 8 & 255] ^ t3[s3 & 255] ^ w[k],
+                t0[s1 >> 24] ^ t1[s2 >> 16 & 255] ^ t2[s3 >> 8 & 255] ^ t3[s0 & 255] ^ w[k + 1],
+                t0[s2 >> 24] ^ t1[s3 >> 16 & 255] ^ t2[s0 >> 8 & 255] ^ t3[s1 & 255] ^ w[k + 2],
+                t0[s3 >> 24] ^ t1[s0 >> 16 & 255] ^ t2[s1 >> 8 & 255] ^ t3[s2 & 255] ^ w[k + 3])
+            k += 4
+        out = b""
+        for a, b, c, d, rk in ((s0, s1, s2, s3, w[k]), (s1, s2, s3, s0, w[k + 1]),
+                               (s2, s3, s0, s1, w[k + 2]), (s3, s0, s1, s2, w[k + 3])):
+            out += ((sbox[a >> 24] << 24 | sbox[b >> 16 & 255] << 16 | sbox[c >> 8 & 255] << 8
+                     | sbox[d & 255]) ^ rk).to_bytes(4, "big")
+        return out
+
+
+def aes_ctr_le(key, data):
+    """AES in counter mode as WinZip AES uses it: the counter is a little-endian
+    block number starting at 1.  Encrypting and decrypting are the same."""
+    aes = _Aes(key)
+    stream = bytearray()
+    for n in range(1, (len(data) + 15) // 16 + 1):
+        stream += aes.encrypt(n.to_bytes(16, "little"))
+    return (int.from_bytes(data, "little")
+            ^ int.from_bytes(bytes(stream[:len(data)]), "little")).to_bytes(len(data), "little")
+
+
+def winzip_aes_read(buf, info, password, limit=KNXPROJ_MAX_MEMBER):
+    """The content of the member `info` of the ZIP archive `buf`, encrypted with
+    WinZip AES (AE-1 or AE-2: PBKDF2-SHA1 keys, AES-CTR, HMAC-SHA1)."""
+    ae, ex, i = None, info.extra, 0
+    while i + 4 <= len(ex):
+        hid, size = struct.unpack_from("<HH", ex, i)
+        if hid == 0x9901 and size >= 7:
+            ae = struct.unpack_from("<H2sBH", ex, i + 4)
+        i += 4 + size
+    if ae is None or ae[1] != b"AE" or ae[2] not in (1, 2, 3) or ae[3] not in (0, 8):
+        raise ImportFailed("%s in the archive is encrypted in a way this server does not read"
+                           % info.filename)
+    klen = 8 * (ae[2] + 1)
+    off = info.header_offset
+    if buf[off:off + 4] != b"PK\x03\x04":
+        raise ImportFailed("%s in the archive is damaged" % info.filename)
+    n, m = struct.unpack_from("<HH", buf, off + 26)
+    start = off + 30 + n + m
+    data = buf[start:start + info.compress_size]
+    if len(data) != info.compress_size or len(data) < klen // 2 + 12:
+        raise ImportFailed("%s in the archive is damaged" % info.filename)
+    salt, check = data[:klen // 2], data[klen // 2:klen // 2 + 2]
+    body, mac = data[klen // 2 + 2:-10], data[-10:]
+    dk = hashlib.pbkdf2_hmac("sha1", password, salt, 1000, 2 * klen + 2)
+    if dk[2 * klen:] != check:
+        raise ImportFailed("the password is wrong")
+    if not hmac.compare_digest(hmac.new(dk[klen:2 * klen], body, "sha1").digest()[:10], mac):
+        raise ImportFailed("%s in the archive is damaged, or the password is wrong"
+                           % info.filename)
+    plain = aes_ctr_le(dk[:klen], body)
+    if ae[3] == 8:
+        try:
+            plain = zlib.decompressobj(-15).decompress(plain, limit + 1)
+        except zlib.error as e:
+            raise ImportFailed("%s in the archive is damaged: %s" % (info.filename, e))
+    if len(plain) > limit:
+        raise ImportFailed("%s in the archive is larger than %d MB"
+                           % (info.filename, limit >> 20))
+    if ae[0] == 1 and zlib.crc32(plain) != info.CRC:      # AE-2 leaves the CRC out
+        raise ImportFailed("%s in the archive is damaged (CRC)" % info.filename)
+    return plain
+
+
+def ets6_archive_password(password):
+    """The ZIP password ETS 6 encrypts a project with, from the project password."""
+    return base64.b64encode(hashlib.pbkdf2_hmac("sha256", password.encode("utf-16-le"),
+                                                KNXPROJ_ETS6_SALT, 65536, 32))
+
+
+def _knxproj_unlock(z, pid, path, password):
+    """-> {name: bytes} of the XML files in the encrypted P-xxxx.zip."""
+    head = b""
+    with contextlib.suppress(KeyError, OSError, zipfile.BadZipFile, RuntimeError):
+        with z.open("knx_master.xml") as f:
+            head = f.read(1024)
+    m = re.search(rb'xmlns="http://knx\.org/xml/project/(\d+)"', head)
+    schema = int(m.group(1)) if m else None
+    if schema is None or schema < KNXPROJ_LOCKED_MIN_SCHEMA:
+        raise ImportFailed("the project in %s is password protected by ETS 5 (schema %s), which "
+                           "this server does not decrypt: export it without a password"
+                           % (path, schema))
+    pw = password() if callable(password) else password
+    if not pw:
+        raise ImportFailed("the project in %s is password protected: give its ETS project "
+                           "password in KNXPROJ_PASSWORD (used for this import only, not "
+                           "stored)" % path)
+    info = z.getinfo(pid + ".zip")
+    if info.file_size > KNXPROJ_MAX_MEMBER:
+        raise ImportFailed("%s.zip in the archive is larger than %d MB"
+                           % (pid, KNXPROJ_MAX_MEMBER >> 20))
+    try:
+        buf = z.read(info)
+        inner = zipfile.ZipFile(io.BytesIO(buf))
+    except (RuntimeError, NotImplementedError, zipfile.BadZipFile, OSError) as e:
+        raise ImportFailed("%s.zip cannot be read from %s: %s" % (pid, path, e))
+    key, files = ets6_archive_password(pw), {}
+    for i in inner.infolist():
+        if "/" in i.filename or not i.filename.endswith(".xml"):
+            continue
+        if i.file_size > KNXPROJ_MAX_MEMBER:
+            raise ImportFailed("%s in the archive is larger than %d MB"
+                               % (i.filename, KNXPROJ_MAX_MEMBER >> 20))
+        if i.compress_type == 99:
+            files[i.filename] = winzip_aes_read(buf, i, key)
+        elif i.flag_bits & 1:
+            raise ImportFailed("%s in the archive is encrypted in a way this server does not "
+                               "read" % i.filename)
+        else:
+            files[i.filename] = inner.read(i)
+    return files
 
 
 def _knxproj_dpt(s):
@@ -1340,6 +1538,43 @@ def _knxproj_serial(b64):
     return raw.hex().upper() if len(raw) == 6 else None
 
 
+_KNXPROJ_PH_RE = re.compile(r"\{\{([^{}:]*)(?::([^{}]*))?\}\}")
+_KNXPROJ_MI_RE = re.compile(r"^(MD-\d+)_(M-\d+)_(MI-\d+)_(.+)$")
+
+
+def knxproj_fill(text, lookup):
+    """An ETS text with its placeholders {{name}} and {{name:default}} filled,
+    the innermost first: lookup(name) gives the text ('' shows the default) or
+    None for an unknown name, whose placeholder stays."""
+    t = str(text or "")
+
+    def one(m):
+        v = lookup(m.group(1).strip())
+        if v is None:
+            return m.group(0)
+        return v if v != "" else (m.group(2) or "")
+    for _ in range(4):
+        if "{{" not in t:
+            break
+        new = _KNXPROJ_PH_RE.sub(one, t)
+        if new == t:
+            break
+        t = new
+    return t
+
+
+def _knxproj_split(ref):
+    """'MD-1_M-21_MI-1_O-2-0_R-23' -> ('MD-1_M-21_MI-1', 'MD-1_O-2-0_R-23'): the
+    module instance and the program's id of what is in it; ('', ref) outside
+    modules, (None, ref) in a module inside a module."""
+    m = _KNXPROJ_MI_RE.match(ref)
+    if not m:
+        return ("", ref) if not ref.startswith("MD-") else (None, ref)
+    if _KNXPROJ_MI_RE.match(m.group(4)) or m.group(4).startswith(("SM-", "MD-")):
+        return None, ref
+    return "%s_%s_%s" % m.group(1, 2, 3), "%s_%s" % (m.group(1), m.group(4))
+
+
 class _KnxprojApp:
     """One application program as the archive carries it: what its objects and
     parameters are called and where a parameter lives."""
@@ -1376,7 +1611,27 @@ class _KnxprojApp:
                         self.enums[tid] = {_clean(en.get("Value")): _clean(en.get("Text"))
                                            for en in _xkids(c, "Enumeration")}
                     break
-        self.params = {}
+        self.params, self.prefs, self.objs, self.orefs = {}, {}, {}, {}
+        # the headings above a parameter, as the ETS shows them: [(text, text parameter)]
+        self.paths = {}
+        self.args = {}       # module argument id -> its name
+        self.given = {}      # module (as the program places it) id -> {argument id: value}
+        self._static(static)
+        mdefs = _xkid(prog, "ModuleDefs")
+        for md in (_xkids(mdefs, "ModuleDef") if mdefs is not None else []):
+            margs = _xkid(md, "Arguments")
+            for a in (_xkids(margs, "Argument") if margs is not None else []):
+                self.args[a.get("Id")] = _clean(a.get("Name"))
+            mst, mdyn = _xkid(md, "Static"), _xkid(md, "Dynamic")
+            if mst is not None:
+                self._static(mst)
+            if mdyn is not None:
+                self._walk(mdyn, [])
+        dyn = _xkid(prog, "Dynamic")
+        if dyn is not None:
+            self._walk(dyn, [])
+
+    def _static(self, static):
         params = _xkid(static, "Parameters")
         for el in (params if params is not None else []):
             if _x(el) == "Parameter":
@@ -1387,12 +1642,11 @@ class _KnxprojApp:
                     loc = _xkid(el, "Property")
                 for p in _xkids(el, "Parameter"):
                     self._param(p, loc)
-        self.prefs = {}
         for r in _xall(static, "ParameterRef"):
             self.prefs[r.get("Id")] = {"param": r.get("RefId"), "text": _clean(r.get("Text")),
                                        "default": r.get("Value")}
-        self.objs = {o.get("Id"): o.attrib for o in _xall(static, "ComObject")}
-        self.orefs = {}
+        objs = {o.get("Id"): o.attrib for o in _xall(static, "ComObject")}
+        self.objs.update(objs)
         for r in _xall(static, "ComObjectRef"):
             base = self.objs.get(r.get("RefId"))
             if base is None:
@@ -1400,22 +1654,21 @@ class _KnxprojApp:
             merged = dict(base)
             merged.update({k: v for k, v in r.attrib.items() if k not in ("Id", "RefId")})
             self.orefs[r.get("Id")] = merged
-        # the headings above a parameter, as the ETS shows them
-        self.paths = {}
-        dyn = _xkid(prog, "Dynamic")
-        if dyn is not None:
-            self._walk(dyn, [])
 
     def _param(self, el, union_loc):
+        # in a module the memory lies at Offset past the value of the argument
+        # BaseOffset names
         loc = None
         own = _xkid(el, "Memory")
         if own is None:
             own = _xkid(el, "Property")
         if own is not None:
-            loc = (own, _int(own.get("Offset"), 0) * 8 + _int(own.get("BitOffset"), 0))
+            loc = (own, _int(own.get("Offset"), 0) * 8 + _int(own.get("BitOffset"), 0),
+                   own.get("BaseOffset"))
         elif union_loc is not None:
             loc = (union_loc, (_int(union_loc.get("Offset"), 0) + _int(el.get("Offset"), 0)) * 8
-                   + _int(union_loc.get("BitOffset"), 0) + _int(el.get("BitOffset"), 0))
+                   + _int(union_loc.get("BitOffset"), 0) + _int(el.get("BitOffset"), 0),
+                   union_loc.get("BaseOffset"))
         self.params[el.get("Id")] = {"text": _clean(el.get("Text")), "type": el.get("ParameterType"),
                                      "default": el.get("Value"), "loc": loc}
 
@@ -1423,10 +1676,13 @@ class _KnxprojApp:
         for c in el:
             tag = _x(c)
             if tag == "ParameterRefRef":
-                self.paths.setdefault(c.get("RefId"), " › ".join(heads[-3:]))
+                self.paths.setdefault(c.get("RefId"), heads[-3:])
             elif tag in ("Channel", "ParameterBlock"):
                 text = _clean(c.get("Text"))
-                self._walk(c, heads + [text] if text else heads)
+                self._walk(c, heads + [(text, c.get("TextParameterRefId"))] if text else heads)
+            elif tag == "Module":
+                self.given[c.get("Id")] = {a.get("RefId"): a.get("Value") for a in c
+                                           if a.get("Value") is not None}
             else:
                 self._walk(c, heads)
 
@@ -1436,13 +1692,19 @@ class _KnxprojApp:
     def short(self, ref):
         return ref[len(self.prefix):] if ref.startswith(self.prefix) else ref
 
-    def location(self, param):
+    def location(self, param, args=None):
         """-> (attr, value): memory as the product pack finds it, a property, or
-        ets_only for a parameter the device never receives."""
+        ets_only for a parameter the device never receives; (None, None) if it
+        lies past a module argument `args` lacks."""
         p = self.params.get(param)
         if p is None or p["loc"] is None:
             return "ets_only", True
-        el, bits = p["loc"]
+        el, bits, base = p["loc"]
+        if base:
+            off = (args or {}).get(self.full(base))
+            if not isinstance(off, int):
+                return None, None
+            bits += off * 8
         size = self.bits.get(p["type"])
         if _x(el) == "Property":
             prop = {"pid": _int(el.get("PropertyId")), "offset": bits // 8,
@@ -1460,28 +1722,28 @@ class _KnxprojApp:
 
 
 def _knxproj_pick(z, path, project):
-    """-> (project id, installation file) of the archive's project."""
+    """-> (project id, installation file) of the archive's project; the file is
+    None if the project is password protected (in an encrypted P-xxxx.zip)."""
     names = z.namelist()
-    locked = sorted({m.group(1) for m in map(_KNXPROJ_LOCKED_RE.match, names) if m})
+    locked = {m.group(1) for m in map(_KNXPROJ_LOCKED_RE.match, names) if m}
     found = collections.defaultdict(list)
     for n in names:
         m = _KNXPROJ_INST_RE.match(n)
         if m:
             found[m.group(1)].append(n)
-    if not found and locked:
-        raise ImportFailed("the project in %s is password protected: export it from ETS "
-                           "without a password (a protected project is encrypted, and this "
-                           "server does not decrypt it)" % path)
-    if not found:
+    every = sorted(set(found) | locked)
+    if not every:
         raise ImportFailed("%s holds no ETS project (no P-xxxx/0.xml)" % path)
-    pids = sorted(found)
+    pids = every
     if project is not None:
         pids = [p for p in pids if p.lower() == str(project).lower()]
         if not pids:
-            raise ImportFailed("no project %r in %s: %s" % (project, path, ", ".join(sorted(found))))
+            raise ImportFailed("no project %r in %s: %s" % (project, path, ", ".join(every)))
     if len(pids) > 1:
         raise ImportFailed("%s holds %d projects, choose one with --project: %s"
                            % (path, len(pids), ", ".join(pids)))
+    if pids[0] not in found:
+        return pids[0], None
     files = sorted(found[pids[0]])
     if len(files) > 1:
         raise ImportFailed("project %s has %d installations (%s); one is supported"
@@ -1489,11 +1751,13 @@ def _knxproj_pick(z, path, project):
     return pids[0], files[0]
 
 
-def import_knxproj(path, project=None):
+def import_knxproj(path, project=None, password=None):
     """-> (claims, seen, ref, report).  Reads a project archive exported by
     ETS 5.7 or later: topology, devices with their product data, locations,
     group addresses, the objects a device shows or links, the links, and the
-    parameter values the project stores (ETS stores those set in it)."""
+    parameter values the project stores (ETS stores those set in it), in
+    modules too.  `password` (text, or a function asked only if needed) opens
+    an ETS 6 project with a project password."""
     report = {}
     try:
         z = zipfile.ZipFile(path)
@@ -1501,7 +1765,20 @@ def import_knxproj(path, project=None):
         raise ImportFailed("%s is not a project archive: %s" % (path, e))
     with z:
         pid, inst_file = _knxproj_pick(z, path, project)
-        root = _knxproj_xml(z, inst_file)
+        if inst_file is None:
+            files = _knxproj_unlock(z, pid, path, password)
+            report["password_protected"] = True
+            insts = sorted(n for n in files if re.match(r"^\d+\.xml$", n))
+            if len(insts) != 1:
+                raise ImportFailed("project %s has %d installations (%s); one is supported"
+                                   % (pid, len(insts), ", ".join(insts)))
+            inst_file = "%s/%s" % (pid, insts[0])
+            root = _knxproj_parse(files[insts[0]], inst_file)
+            info = (_knxproj_parse(files["project.xml"], "%s/project.xml" % pid)
+                    if "project.xml" in files else None)
+        else:
+            root = _knxproj_xml(z, inst_file)
+            info = _knxproj_xml(z, "%s/project.xml" % pid)
         m = _KNXPROJ_NS_RE.match(root.tag)
         schema = int(m.group(1)) if m else None
         report["schema"] = schema
@@ -1510,7 +1787,6 @@ def import_knxproj(path, project=None):
                                "ETS 5.7 or later and export it again" % (path, schema))
         if schema > KNXPROJ_CHECKED_SCHEMA:
             report["schema_unchecked"] = True
-        info = _knxproj_xml(z, "%s/project.xml" % pid)
         pinfo = next(iter(_xall(info, "ProjectInformation")), None) if info is not None else None
         pname = _clean(pinfo.get("Name")) if pinfo is not None else ""
         ref = "knxproj:%s" % (pname or pid)
@@ -1645,10 +1921,19 @@ def _knxproj_device(di, lk, ref, claims, report, count, where, products, h2p, ha
         count("devices_without_address")
         return
     claims.append(("device", ia, "present", True, ref))
-    for attr, col in (("name", "Name"), ("description", "Description"), ("comment", "Comment")):
+    for attr, col in (("name", "Name"), ("description", "Description")):
         t = _knxproj_text(di.get(col), report)
         if t:
             claims.append(("device", ia, attr, t, ref))
+    # what ETS 6.4 shows as a device's comment it exports as InstallationHints
+    # (RTF), with Comment left empty
+    notes = []
+    for col in ("Comment", "InstallationHints"):
+        t = _knxproj_text(di.get(col), report)
+        if t and t not in notes:
+            notes.append(t)
+    if notes:
+        claims.append(("device", ia, "comment", " · ".join(notes), ref))
     if where.get(di.get("Id")):
         claims.append(("device", ia, "location", where[di.get("Id")], ref))
     serial = _knxproj_serial(di.get("SerialNumber"))
@@ -1686,9 +1971,53 @@ def _knxproj_device(di, lk, ref, claims, report, count, where, products, h2p, ha
     if aid:
         claims.append(("device", ia, "app_id", aid, ref))
 
-    # objects: those the device shows (its object tree) and those linked
+    # module instances: the values of their arguments, as ETS 6.4 writes them
+    margs = {}
+    mie = _xkid(di, "ModuleInstances")
+    for mi in (_xkids(mie, "ModuleInstance") if mie is not None else []):
+        vals = {app.full(a): _knxproj_value(v)
+                for a, v in app.given.get(app.full(mi.get("RefId") or ""), {}).items()}
+        ael = _xkid(mi, "Arguments")
+        for a in (_xkids(ael, "Argument") if ael is not None else []):
+            vals[app.full(a.get("RefId") or "")] = _knxproj_value(a.get("Value"))
+        margs[mi.get("Id")] = vals
+    arg_names = {mi: {app.args[a]: str(v) for a, v in vals.items() if app.args.get(a)}
+                 for mi, vals in margs.items()}
+
+    # the parameter values the project stores, by module instance ('' outside
+    # modules) and the program's ParameterRef
+    pvals, pin = {}, []
+    pir = _xkid(di, "ParameterInstanceRefs")
+    for p in (_xkids(pir, "ParameterInstanceRef") if pir is not None else []):
+        mi, local = _knxproj_split(app.short(p.get("RefId") or ""))
+        pin.append((p, mi, local))
+        if mi is not None:
+            pvals[(mi, app.full(local))] = p.get("Value")
+
+    def lookup(mi, tparam):
+        """Placeholders in a text: {{0}} is the value of the text parameter,
+        {{name}} the module argument of that name."""
+        def get(name):
+            if name != "0":
+                return arg_names.get(mi, {}).get(name)
+            if not tparam:
+                return ""
+            raw = pvals.get((mi, app.full(tparam)))
+            if raw is None:
+                pref = app.prefs.get(app.full(tparam)) or {}
+                raw = pref.get("default")
+                if raw is None:
+                    raw = app.params.get(pref.get("param"), {}).get("default")
+            return _knxproj_text(raw) or ""
+        return get
+
+    # objects: those the device shows (its object tree, with the channels and
+    # folders in it) and those linked
     tree_el = _xkid(di, "GroupObjectTree")
-    tree = (tree_el.get("GroupObjectInstances") or "").split() if tree_el is not None else None
+    tree = None
+    if tree_el is not None:
+        tree = list(dict.fromkeys(r for el in tree_el.iter()
+                                  for r in (el.get("GroupObjectInstances") or "").split()))
     if tree is None and app.orefs:
         count("devices_without_object_tree")
     inst = {}
@@ -1704,21 +2033,30 @@ def _knxproj_device(di, lk, ref, claims, report, count, where, products, h2p, ha
         links = (c.get("Links") or "").split() if c is not None else []
         if r not in shown and not links:
             continue
-        if r.startswith("MD-") or "_MD-" in r:
+        mi, local = _knxproj_split(r)
+        if mi is None:
             count("module_objects_not_read")
             continue
-        o = app.orefs.get(app.full(r))
+        o = app.orefs.get(app.full(local))
         num = _int(o.get("Number")) if o else None
         if num is None:
             count("objects_not_in_application")
             continue
+        if o.get("BaseNumber"):
+            # in a module: Number counts from the value of the argument BaseNumber names
+            base = margs.get(mi, {}).get(app.full(o["BaseNumber"]))
+            if not isinstance(base, int):
+                count("module_objects_not_read")
+                continue
+            num += base
         own = dict(o)
         if c is not None:
             own.update({k: v for k, v in c.attrib.items() if k not in ("RefId", "Links")})
         k = obj_key(ia, num)
+        fill = lookup(mi, own.get("TextParameterRefId"))
         for attr, col in (("name", "Text"), ("function", "FunctionText"),
                           ("description", "Description")):
-            t = _knxproj_text(own.get(col), report)
+            t = _knxproj_text(knxproj_fill(own.get(col), fill), report)
             if t:
                 claims.append(("object", k, attr, t, ref))
         size = _clean(own.get("ObjectSize"))
@@ -1746,33 +2084,43 @@ def _knxproj_device(di, lk, ref, claims, report, count, where, products, h2p, ha
             if size:
                 group_sizes[ga][size] += 1
 
-    # parameters: the values the project stores
-    pir = _xkid(di, "ParameterInstanceRefs")
-    for p in (_xkids(pir, "ParameterInstanceRef") if pir is not None else []):
-        r = p.get("RefId") or ""
-        if r.startswith("MD-") or "_MD-" in r:
+    # parameters: the values the project stores; one in a module is
+    # device:<module instance>_<parameter>, e.g. 1.1.2:MD-1_M-21_MI-1_UP-2
+    for p, mi, local in pin:
+        if mi is None:
             count("module_parameters_not_read")
             continue
-        pref = app.prefs.get(app.full(r))
+        pref = app.prefs.get(app.full(local))
         if pref is None:
             count("parameters_not_in_application")
             continue
         par = app.params.get(pref["param"], {})
-        k = "%s:%s" % (ia, app.short(pref["param"]))
+        pid = app.short(pref["param"])
+        if mi:
+            pid = "%s_%s" % (mi, pid.split("_", 1)[1] if pid.startswith("MD-") else pid)
+        k = "%s:%s" % (ia, pid)
         raw = p.get("Value")
         value = _knxproj_value(raw)
         claims.append(("param", k, "value", value, ref))
-        name = pref["text"] or par.get("text")
+        name = _clean(knxproj_fill(pref["text"] or par.get("text"), lookup(mi, None)))
         if name:
             claims.append(("param", k, "name", name, ref))
         text = app.enums.get(par.get("type"), {}).get(_clean(raw))
         if text:
             claims.append(("param", k, "text", text, ref))
-        pth = app.paths.get(app.full(r))
+        heads = []
+        for t, tp in app.paths.get(app.full(local), []):
+            h = _clean(knxproj_fill(t, lookup(mi, tp)))
+            if h and (not heads or heads[-1] != h):      # a channel and its block alike
+                heads.append(h)
+        pth = " › ".join(heads)
         if pth:
             claims.append(("param", k, "path", pth, ref))
-        attr, loc = app.location(pref["param"])
-        claims.append(("param", k, attr, loc, ref))
+        attr, loc = app.location(pref["param"], margs.get(mi))
+        if attr is None:
+            count("module_parameters_without_location")
+        else:
+            claims.append(("param", k, attr, loc, ref))
         dflt = pref["default"] if pref["default"] is not None else par.get("default")
         if dflt is not None and _clean(dflt) != _clean(raw):
             claims.append(("param", k, "default", _knxproj_value(dflt), ref))
@@ -5355,6 +5703,17 @@ def export_for_stick(store, dest, inst=None):
     return facts
 
 
+def _knxproj_password(path):
+    """The project password of an ETS 6 archive, asked for only if it has one:
+    KNXPROJ_PASSWORD, else typed in at a terminal.  Never stored."""
+    def ask():
+        pw = os.environ.get("KNXPROJ_PASSWORD")
+        if pw is None and sys.stdin.isatty():
+            pw = getpass.getpass("ETS project password of %s: " % os.path.basename(path))
+        return pw
+    return ask
+
+
 def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, by=None):
     """-> list of (path, stats)."""
     results = []
@@ -5380,7 +5739,7 @@ def run_import(store, fmt, paths, inst, as_of=None, project=None, source=None, b
         ts, date_from = _dated(as_of, seen, p)
         st = record_import(store, inst, "ets", "ets3", ref, ts, claims, everything, by, date_from)
     elif fmt == "knxproj":
-        claims, seen, ref, report = import_knxproj(p, project)
+        claims, seen, ref, report = import_knxproj(p, project, _knxproj_password(p))
         ts, date_from = _dated(as_of, seen, p)
         st = record_import(store, inst, "knxproj", "knxproj", ref, ts, claims, everything, by,
                            date_from, extra={"archive": report} if report else None)

@@ -5,12 +5,15 @@ import contextlib
 import csv
 import datetime
 import gzip
+import hashlib
+import hmac
 import http.client
 import io
 import json
 import os
 import shutil
 import sqlite3
+import struct
 import sys
 import tempfile
 import threading
@@ -408,6 +411,7 @@ KNXPROJ_APPLICATION = """<?xml version="1.0" encoding="utf-8"?>
      <Enumeration Text="1 min" Value="4" Id="{a}_PT-Base_EN-4"/></TypeRestriction></ParameterType>
    <ParameterType Id="{a}_PT-Num" Name="Num"><TypeNumber SizeInBit="8" Type="unsignedInt" minInclusive="0" maxInclusive="255"/></ParameterType>
    <ParameterType Id="{a}_PT-Nibble" Name="Nibble"><TypeNumber SizeInBit="4" Type="unsignedInt" minInclusive="0" maxInclusive="15"/></ParameterType>
+   <ParameterType Id="{a}_PT-Text" Name="Text"><TypeText SizeInBit="80"/></ParameterType>
   </ParameterTypes>
   <Parameters>
    <Parameter Id="{a}_P-1" Name="Base" ParameterType="{a}_PT-Base" Text="Staircase time base" Value="4">
@@ -439,12 +443,44 @@ KNXPROJ_APPLICATION = """<?xml version="1.0" encoding="utf-8"?>
    <ComObjectRef Id="{a}_O-2_R-2" RefId="{a}_O-2"/>
   </ComObjectRefs>
  </Static>
+ <ModuleDefs><ModuleDef Id="{a}_MD-1" Name="Input">
+  <Arguments><Argument Id="{a}_MD-1_A-1" Name="ChNo" Allocates="1"/>
+   <Argument Id="{a}_MD-1_A-2" Name="ObjBase" Allocates="10"/>
+   <Argument Id="{a}_MD-1_A-3" Name="ParBase" Allocates="4"/></Arguments>
+  <Static>
+   <Parameters>
+    <Parameter Id="{a}_MD-1_P-1" Name="Debounce" ParameterType="{a}_PT-Num" Text="Debounce {{{{ChNo}}}}" Value="0">
+      <Memory CodeSegment="{a}_RS-04-00000" Offset="1" BitOffset="0" BaseOffset="{a}_MD-1_A-3"/></Parameter>
+    <Parameter Id="{a}_MD-1_P-2" Name="Label" ParameterType="{a}_PT-Text" Text="Name of the input" Value=""/>
+   </Parameters>
+   <ParameterRefs>
+    <ParameterRef Id="{a}_MD-1_P-1_R-1" RefId="{a}_MD-1_P-1"/>
+    <ParameterRef Id="{a}_MD-1_P-2_R-2" RefId="{a}_MD-1_P-2"/>
+   </ParameterRefs>
+   <ComObjects>
+    <ComObject Id="{a}_MD-1_O-3-0" Name="In" Text="Input {{{{ChNo}}}}: {{{{0:unnamed}}}}" Number="0" BaseNumber="{a}_MD-1_A-2" FunctionText="Switch" ObjectSize="1 Bit" ReadFlag="Disabled" WriteFlag="Disabled" CommunicationFlag="Enabled" TransmitFlag="Enabled" UpdateFlag="Disabled" ReadOnInitFlag="Disabled" DatapointType="DPST-1-1"/>
+   </ComObjects>
+   <ComObjectRefs>
+    <ComObjectRef Id="{a}_MD-1_O-3-0_R-1" RefId="{a}_MD-1_O-3-0" TextParameterRefId="{a}_MD-1_P-2_R-2"/>
+   </ComObjectRefs>
+  </Static>
+  <Dynamic><Channel Id="{a}_MD-1_CH-1" Name="In" Text="Input {{{{ChNo}}}}" TextParameterRefId="{a}_MD-1_P-2_R-2">
+    <ParameterBlock Id="{a}_MD-1_PB-1" Name="Set" Text="Settings">
+     <ParameterRefRef RefId="{a}_MD-1_P-1_R-1"/><ComObjectRefRef RefId="{a}_MD-1_O-3-0_R-1"/>
+    </ParameterBlock></Channel></Dynamic>
+ </ModuleDef></ModuleDefs>
  <Dynamic><Channel Id="{a}_CH-1" Name="A" Text="A">
    <ParameterBlock Id="{a}_PB-1" Name="Sw" Text="Switching">
      <ParameterRefRef RefId="{a}_P-1_R-1"/>
      <choose ParamRefId="{a}_P-1_R-1"><when test="3"><ParameterRefRef RefId="{a}_P-2_R-2"/></when></choose>
      <ComObjectRefRef RefId="{a}_O-0_R-0"/>
-   </ParameterBlock></Channel></Dynamic>
+   </ParameterBlock></Channel>
+   <Repeat Id="{a}_X-1" Name="Inputs" Count="2">
+    <Module Id="{a}_MD-1_M-1" RefId="{a}_MD-1">
+     <NumericArg RefId="{a}_MD-1_A-1" AllocatorRefId="{a}_L-1"/>
+     <NumericArg RefId="{a}_MD-1_A-2" AllocatorRefId="{a}_L-2"/>
+     <NumericArg RefId="{a}_MD-1_A-3" Value="8"/>
+    </Module></Repeat></Dynamic>
 </ApplicationProgram>
 </ApplicationPrograms></Manufacturer></ManufacturerData></KNX>"""
 
@@ -461,6 +497,7 @@ KNXPROJ_INSTALLATION = """<?xml version="1.0" encoding="utf-8"?>
     <Segment Id="P-0ABC-0_S-1" Number="0" MediumTypeRefId="MT-0">
      <DeviceInstance Id="P-0ABC-0_DI-1" Address="3" Name="Kitchen actuator" Description="Kitchen board"
         Comment="{{\\rtf1\\ansi Bought 2021}}" SerialNumber="{serial}"
+        InstallationHints="{{\\rtf1\\ansi\\ansicpg1252 {{\\f2 Behind the \\'e4 panel}}\\par&#xD;&#xA;}}"
         ProductRefId="M-FFF0_H-1-1_P-SW.2D8" Hardware2ProgramRefId="M-FFF0_H-1-1_HP-1234-10-ABCD"
         LastModified="2026-02-01T09:00:00.5Z" LastDownload="2026-02-01T09:05:00Z">
       <ParameterInstanceRefs>
@@ -470,15 +507,31 @@ KNXPROJ_INSTALLATION = """<?xml version="1.0" encoding="utf-8"?>
        <ParameterInstanceRef RefId="{a}_P-4_R-4" Value="0"/>
        <ParameterInstanceRef RefId="{a}_P-5_R-5" Value="12"/>
        <ParameterInstanceRef RefId="{a}_MD-1_M-1_MI-1_P-1_R-1" Value="1"/>
+       <ParameterInstanceRef RefId="{a}_MD-1_M-1_MI-1_P-2_R-2" Value="Hall"/>
+       <ParameterInstanceRef RefId="{a}_MD-1_M-1_MI-2_P-1_R-1" Value="2"/>
+       <ParameterInstanceRef RefId="{a}_MD-1_M-1_MI-1_MD-2_M-1_MI-1_P-1_R-1" Value="1"/>
       </ParameterInstanceRefs>
       <ComObjectInstanceRefs>
        <ComObjectInstanceRef RefId="O-0_R-0" Links="{links0}"/>
        <ComObjectInstanceRef RefId="O-1_R-1" Text="Kitchen light on" Links="GA-3"/>
        <ComObjectInstanceRef RefId="O-2_R-2" Links="GA-2"/>
        <ComObjectInstanceRef RefId="MD-1_M-1_MI-1_O-3-0_R-1" Links="GA-3"/>
+       <ComObjectInstanceRef RefId="MD-1_M-1_MI-1_SM-1_M-1_MI-1_O-1_R-1" Links="GA-3"/>
        <ComObjectInstanceRef RefId="O-9_R-9" Links="GA-3"/>
       </ComObjectInstanceRefs>
-      <GroupObjectTree GroupObjectInstances="O-0_R-0 O-1_R-1"/>
+      <ModuleInstances>
+       <ModuleInstance Id="MD-1_M-1_MI-1" RefId="MD-1_M-1" RepeatIndex="1x1">
+        <Arguments><Argument RefId="MD-1_A-1" Value="1"/><Argument RefId="MD-1_A-2" Value="20"/></Arguments>
+       </ModuleInstance>
+       <ModuleInstance Id="MD-1_M-1_MI-2" RefId="MD-1_M-1" RepeatIndex="1x2">
+        <Arguments><Argument RefId="MD-1_A-1" Value="2"/><Argument RefId="MD-1_A-2" Value="30"/>
+         <Argument RefId="MD-1_A-3" Value="12"/></Arguments>
+       </ModuleInstance>
+      </ModuleInstances>
+      <GroupObjectTree GroupObjectInstances="O-0_R-0 O-1_R-1">
+       <Nodes><Node Type="Channel" RefId="MD-1_M-1_MI-2_CH-1" GroupObjectInstances="MD-1_M-1_MI-2_O-3-0_R-1"/></Nodes>
+      </GroupObjectTree>
+      <Security ToolKey="VG9vbEtleU5vdEltcG9ydGVk"/>
      </DeviceInstance>
      <DeviceInstance Id="P-0ABC-0_DI-2" Name="Not yet addressed"
         ProductRefId="M-FFF0_H-1-1_P-SW.2D8" Hardware2ProgramRefId="M-FFF0_H-1-1_HP-1234-10-ABCD"/>
@@ -498,7 +551,8 @@ KNXPROJ_INSTALLATION = """<?xml version="1.0" encoding="utf-8"?>
    <GroupRange Id="P-0ABC-0_GR-2" RangeStart="6400" RangeEnd="6655" Name="Kitchen">
     <GroupAddress Id="P-0ABC-0_GA-1" Address="6407" Name="Kitchen light" DatapointType="DPST-1-1"/>
     <GroupAddress Id="P-0ABC-0_GA-2" Address="6408" Name="All lights" Central="true" DatapointType="DPT-1"/>
-    <GroupAddress Id="P-0ABC-0_GA-3" Address="6409" Name="Kitchen light status" Comment="{{\\rtf1 x}}"/>
+    <GroupAddress Id="P-0ABC-0_GA-3" Address="6409" Name="Kitchen light status" Comment="{{\\rtf1 x}}"
+       Key="R0FLZXlOb3RJbXBvcnRlZA=="/>
    </GroupRange>
    <GroupRange Id="P-0ABC-0_GR-3" RangeStart="7000" RangeEnd="7099" Name="Free style"/>
   </GroupRange>
@@ -509,10 +563,36 @@ KNXPROJ_INSTALLATION = """<?xml version="1.0" encoding="utf-8"?>
 </Installation></Installations></Project></KNX>"""
 
 
+def winzip_aes(members, password, ae=2):
+    """A ZIP archive whose members are encrypted with WinZip AES-256, deflated."""
+    out, central = bytearray(), bytearray()
+    for name, data in members:
+        c = zlib.compressobj(9, zlib.DEFLATED, -15)
+        body = c.compress(data) + c.flush()
+        salt = os.urandom(16)
+        dk = hashlib.pbkdf2_hmac("sha1", password, salt, 1000, 66)
+        ct = k.aes_ctr_le(dk[:32], body)
+        payload = salt + dk[64:] + ct + hmac.new(dk[32:64], ct, "sha1").digest()[:10]
+        extra = struct.pack("<HHH2sBH", 0x9901, 7, ae, b"AE", 3, 8)
+        crc = zlib.crc32(data) if ae == 1 else 0
+        nb, off = name.encode(), len(out)
+        out += struct.pack("<IHHHHHIIIHH", 0x04034B50, 51, 1, 99, 0, 0, crc, len(payload),
+                           len(data), len(nb), len(extra)) + nb + extra + payload
+        central += struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 51, 51, 1, 99, 0, 0, crc,
+                               len(payload), len(data), len(nb), len(extra), 0, 0, 0, 0,
+                               off) + nb + extra
+    cd = len(out)
+    out += central + struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(members), len(members),
+                                 len(central), cd, 0)
+    return bytes(out)
+
+
 def make_knxproj(path, schema=23, modified="2026-03-01T10:00:00.1234567Z", links0="GA-1 GA-2",
-                 locked=False):
+                 locked=False, password="Test-pw 1", ae=2):
     ns = KNXPROJ_NS % schema
     serial = base64.b64encode(bytes.fromhex("FFF000000001")).decode()
+    project = KNXPROJ_PROJECT.format(ns=ns, modified=modified)
+    inst = KNXPROJ_INSTALLATION.format(ns=ns, a=KNXPROJ_APP, serial=serial, links0=links0)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("knx_master.xml", KNXPROJ_MASTER.format(ns=ns))
         z.writestr("M-FFF0/Hardware.xml", KNXPROJ_HARDWARE.format(ns=ns))
@@ -520,11 +600,12 @@ def make_knxproj(path, schema=23, modified="2026-03-01T10:00:00.1234567Z", links
         z.writestr("P-0ABC.info", json.dumps({"ProjectName": "Demo",
                                               "IsPasswordProtected": locked}))
         if locked:
-            z.writestr("P-0ABC.zip", b"PK\x03\x04 encrypted")
+            z.writestr("P-0ABC.zip", winzip_aes(
+                [("0.xml", inst.encode()), ("project.xml", project.encode())],
+                k.ets6_archive_password(password), ae))
             return path
-        z.writestr("P-0ABC/project.xml", KNXPROJ_PROJECT.format(ns=ns, modified=modified))
-        z.writestr("P-0ABC/0.xml", KNXPROJ_INSTALLATION.format(
-            ns=ns, a=KNXPROJ_APP, serial=serial, links0=links0))
+        z.writestr("P-0ABC/project.xml", project)
+        z.writestr("P-0ABC/0.xml", inst)
     return path
 
 
@@ -543,7 +624,8 @@ class TestKnxproj(Base):
         d = lambda attr: c[("device", "1.2.3", attr)]  # noqa: E731
         self.assertEqual(d("name"), "Kitchen actuator")
         self.assertEqual(d("description"), "Kitchen board")
-        self.assertEqual(d("comment"), "Bought 2021")                      # RTF in the file
+        # ETS 6.4 exports the comment it shows as InstallationHints, both in RTF
+        self.assertEqual(d("comment"), "Bought 2021 · Behind the ä panel")
         self.assertEqual(d("location"), "Demo house › Ground floor › Kitchen")
         self.assertEqual(d("serial"), "FFF000000001")                      # as a stick reads it
         self.assertEqual(d("app_id"), "FFF0123410")                        # as a stick reads it
@@ -594,10 +676,87 @@ class TestKnxproj(Base):
         self.assertEqual(c[("param", "1.2.3:P-5", "property")],
                          {"pid": 200, "offset": 0, "bit_offset": 0, "size_bits": 8,
                           "object_index": 0})
+        # modules: numbers and memory past the instance's arguments, texts filled in
+        self.assertEqual(c[("object", "1.2.3#20", "name")], "Input 1: Hall")      # {{0}} set
+        self.assertFalse(c[("object", "1.2.3#20", "visible")])
+        self.assertTrue(c[("link", "1.2.3#20>3/1/9", "send")])
+        self.assertEqual(c[("object", "1.2.3#30", "name")], "Input 2: unnamed")   # its default
+        self.assertNotIn(("object", "1.2.3#30", "visible"), c)              # in a channel node
+        self.assertEqual(c[("object", "1.2.3#30", "flags")], "C--T--")
+        p = "1.2.3:MD-1_M-1_MI-1_P-1"
+        self.assertEqual((c[("param", p, "value")], c[("param", p, "name")],
+                          c[("param", p, "path")]), (1, "Debounce 1", "Input 1 › Settings"))
+        self.assertEqual(c[("param", p, "memory")],                          # given in the program
+                         {"segment": "RS-04-00000", "offset": 9, "bit_offset": 0, "size_bits": 8})
+        self.assertEqual(c[("param", "1.2.3:MD-1_M-1_MI-2_P-1", "memory")],  # in the instance
+                         {"segment": "RS-04-00000", "offset": 13, "bit_offset": 0, "size_bits": 8})
+        self.assertEqual(c[("param", "1.2.3:MD-1_M-1_MI-1_P-2", "value")], "Hall")
+        self.assertTrue(c[("param", "1.2.3:MD-1_M-1_MI-1_P-2", "ets_only")])
+        # the keys of a secure installation stay out of the record
+        for key in ("VG9vbEtleU5vdEltcG9ydGVk", "R0FLZXlOb3RJbXBvcnRlZA"):
+            self.assertNotIn(key, repr(claims))
         self.assertEqual(report, {"schema": 23, "devices_without_address": 1,
                                   "module_objects_not_read": 1, "objects_not_in_application": 1,
                                   "module_parameters_not_read": 1,
                                   "ranges_not_main_or_middle": 1})
+
+    def test_password_protected(self):
+        pw = "Test-pw 1"
+        plain = k.import_knxproj(self.archive())
+        for ae in (1, 2):
+            claims, seen, ref, report = k.import_knxproj(
+                self.archive("locked%d.knxproj" % ae, locked=True, password=pw, ae=ae), password=pw)
+            self.assertEqual(sorted(claims), sorted(plain[0]))
+            self.assertEqual((seen, ref), plain[1:3])
+            self.assertTrue(report.pop("password_protected"))
+            self.assertEqual(report, plain[3])
+        asked = []
+        k.import_knxproj(self.archive(), password=lambda: asked.append(1))   # not protected
+        self.assertEqual(asked, [])
+        locked = self.archive("locked.knxproj", locked=True, password=pw)
+        self.assertTrue(k.import_knxproj(locked, password=lambda: pw)[0])
+        for given, words in ((None, "KNXPROJ_PASSWORD"), ("", "KNXPROJ_PASSWORD"),
+                             ("test-pw 1", "password is wrong")):
+            with self.assertRaises(k.ImportFailed) as cm:
+                k.import_knxproj(locked, password=given)
+            self.assertIn(words, str(cm.exception))
+        with self.assertRaises(k.ImportFailed) as cm:
+            k.import_knxproj(self.archive("ets5.knxproj", schema=20, locked=True), password=pw)
+        self.assertIn("ETS 5", str(cm.exception))
+        # the CLI takes it from the environment
+        data = os.path.join(self.tmp, "cli")
+        self.assertEqual(k.main(["init", "--data", data, "--installation", "x", "--name", "X"]), 0)
+        old_env = os.environ.get("KNXPROJ_PASSWORD")
+        os.environ["KNXPROJ_PASSWORD"] = pw
+        buf, old = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            rc = k.main(["import", "knxproj", locked, "--installation", "x", "--data", data])
+        finally:
+            sys.stdout = old
+            if old_env is None:
+                del os.environ["KNXPROJ_PASSWORD"]
+            else:
+                os.environ["KNXPROJ_PASSWORD"] = old_env
+        self.assertEqual(rc, 0)
+        self.assertNotIn(pw, buf.getvalue())
+
+    def test_aes(self):
+        # FIPS-197 appendix C
+        pt = bytes.fromhex("00112233445566778899aabbccddeeff")
+        for n, ct in ((16, "69c4e0d86a7b0430d8cdb78070b4c55a"),
+                      (24, "dda97ca4864cdfe06eaf70a0ec0d7191"),
+                      (32, "8ea2b7ca516745bfeafc49904b496089")):
+            self.assertEqual(k._Aes(bytes(range(n))).encrypt(pt).hex(), ct)
+        data = os.urandom(1000)
+        self.assertEqual(k.aes_ctr_le(b"k" * 32, k.aes_ctr_le(b"k" * 32, data)), data)
+
+    def test_fill(self):
+        names = {"ChNo": "3", "Empty": ""}.get
+        self.assertEqual(k.knxproj_fill("F{{ChNo}}: {{0:Function {{ChNo}}}}",
+                                        lambda n: "" if n == "0" else names(n)),
+                         "F3: Function 3")
+        self.assertEqual(k.knxproj_fill("{{Unknown}} {{Empty:x}} {{Empty}}.", names), "{{Unknown}} x .")
 
     def test_rtf_text(self):
         self.assertEqual(k.rtf_text(r"{\rtf1\ansi\uc1{\fonttbl{\f0 Segoe UI;}}{\*\generator W;}"
@@ -632,9 +791,6 @@ class TestKnxproj(Base):
         self.assertIn("knxproj", [s["source"] for s in self.ok("proj-brief")["sources"]])
 
     def test_refused(self):
-        with self.assertRaises(k.ImportFailed) as cm:
-            k.import_knxproj(self.archive("locked.knxproj", locked=True))
-        self.assertIn("password", str(cm.exception))
         with self.assertRaises(k.ImportFailed) as cm:
             k.import_knxproj(self.archive("old.knxproj", schema=14))
         self.assertIn("ETS 5.7", str(cm.exception))

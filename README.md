@@ -133,7 +133,7 @@ docker compose exec knxproject-mcp python /app/knxproject_mcp.py import esf /imp
 | format | source | input |
 |---|---|---|
 | `ets3` | `ets` | an ETS3 project database dumped to one gzip CSV per table (`--project NAME`) |
-| `knxproj` | `knxproj` | a project archive exported by ETS 5.7 or later, without a password |
+| `knxproj` | `knxproj` | a project archive exported by ETS 5.7 or later (from ETS 6 also with a project password) |
 | `esf` | `esf` | ETS group address export |
 | `inventory` | `bus` | the reply of a busware KNX stick's `knx_inventory` |
 | `observe` | `observed` | `knx_observe_list` (traffic per group address or sender) |
@@ -147,12 +147,26 @@ serial number as a stick reads them), locations, group addresses with their
 datapoint types, the objects a device shows or links, the links (the first
 group address of an object is its sending one; ETS moves the address made
 sending to the front), names, descriptions and comments (a text ETS wrote as
-RTF is reduced to its text) and the parameter values the project lists. In the ETS 6.4 exports checked, a project lists only the
-parameters whose value differs from the default; one at its default gets no
-claim. Objects and parameters of module instances (`MD-…`) are not read yet;
-the import counts them, and whatever else it passed over, under `archive` in
-its stats, and the command prints that line. A password-protected export is
-refused: ETS encrypts the project, and this server does not decrypt it.
+RTF is reduced to its text; what ETS 6.4 shows as a device's comment it
+exports as `InstallationHints`) and the parameter values the project lists.
+In the ETS 6.4 exports checked, a project lists only the parameters whose
+value differs from the default; one at its default gets no claim.
+
+Objects and parameters in module instances are read with the values ETS
+stored for the instance's arguments: an object's number counts from the
+argument its `BaseNumber` names, a parameter's memory from the one its
+`BaseOffset` names, and texts get their `{{…}}` placeholders filled in as ETS
+shows them. A parameter in a module is `device:<instance>_<parameter>`, e.g.
+`1.1.2:MD-1_M-21_MI-1_UP-2`. Modules inside modules are not read; the import
+counts them, and whatever else it passed over, under `archive` in its stats,
+and the command prints that line.
+
+ETS 6 encrypts a project that has a project password (in the export checked,
+ETS 6.4 required one for a project with a KNX Data Secure device). The import
+decrypts it with the password from `KNXPROJ_PASSWORD`, or asks for it at a
+terminal; the password is used for that import only and stored nowhere, and
+the security keys the project holds are not read. A password-protected archive
+from ETS 5 is refused: export it without a password.
 
 An import speaks for its source as of its date. One older than what the record
 already holds from that source (a backup imported after a newer one) extends
